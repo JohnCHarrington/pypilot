@@ -73,7 +73,7 @@ class sys_dep(dep):
             import apt
             return apt.Cache()[self.name].is_installed
         except Exception as e:
-            print("Failed to detect package", self.name, i)
+            print("Failed to detect package", self.name)
         return False
 
     def install(self):
@@ -191,6 +191,9 @@ ss('autopilot', 'core autopilot or imu-only mode',
 # dependencies not required but reduce cpu usage considerably
 ss('optimize', '(recommended) core autopilot operations',
    [py_dep('ujson'), py_dep('pyudev'), py_dep('inotify')])
+
+ss('nmea2000', 'nmea2000 support',
+   [py_dep('pyserial-asyncio'), py_dep('python-can'), py_dep('tenacity')])
 
 # signalk dependencies: python3-zerconf python3-requests python3-websocket
 ss('signalk', 'communicate with signalk-node-server distributed with openploter',
