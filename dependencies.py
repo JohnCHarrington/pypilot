@@ -193,6 +193,9 @@ ss('autopilot', 'core autopilot or imu-only mode',
 ss('optimize', '(recommended) core autopilot operations',
    [py_dep('ujson'), py_dep('pyudev'), py_dep('inotify')])
 
+ss('nmea2000', 'nmea2000 support',
+   [py_dep('pyserial-asyncio'), py_dep('python-can'), py_dep('tenacity')])
+
 # signalk dependencies: python3-zerconf python3-requests python3-websocket
 ss('signalk', 'communicate with signalk-node-server distributed with openploter',
    [py_dep('zeroconf'), py_dep('requests'), py_dep('websocket')])
