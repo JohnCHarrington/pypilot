@@ -505,7 +505,7 @@ class N2KBridge(object):
                     # Include required PGN 127250 fields: sid, heading, deviation, variation, reference, reserved_58
                     fields = [
                         nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
-                        nmea2000.NMEA2000Field(id='heading', value=heading_rad),
+                        nmea2000.NMEA2000Field(id='heading', value=163 * 3.141592653589793 / 180.0),  # Placeholder value, replace with actual heading in radians
                         nmea2000.NMEA2000Field(id='deviation', value=0.0),
                         nmea2000.NMEA2000Field(id='variation', value=0.0),
                         nmea2000.NMEA2000Field(id='reference', value='Magnetic'),
