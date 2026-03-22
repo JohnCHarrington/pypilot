@@ -126,7 +126,7 @@ class NMEA2000Field:
     description: str | None = None
     unit_of_measurement: str | None = None
     value: str | int | float | bytes | time | date | None = 0
-    raw_value: int | float | str | bytes | None = 0
+    raw_value: int | float | str | bytes | None = None
     physical_quantities: PhysicalQuantities | None = None
     type: FieldTypes = FieldTypes.NUMBER
     part_of_primary_key: bool | None = None

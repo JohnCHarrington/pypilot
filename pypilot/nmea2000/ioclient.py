@@ -108,6 +108,7 @@ class AsyncIOClient(ABC):
             build_network_map = build_network_map)
         self.encoder = NMEA2000Encoder()
         self.lock = asyncio.Lock()
+        self.send_lock = asyncio.Lock()
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -281,13 +282,14 @@ class AsyncIOClient(ABC):
             nmea2000Message: The NMEA2000Message object to send.
         """
         try:
-            encoded_messages = self._encode_impl(nmea2000Message)
-            for encoded_message in encoded_messages:
-                await self._send_impl(encoded_message)
-                if isinstance(encoded_message, bytes):
-                    self.logger.debug(f"Sent: {encoded_message.hex()}")
-                else:
-                    self.logger.debug(f"Sent: {encoded_message}")
+            async with self.send_lock:
+                encoded_messages = self._encode_impl(nmea2000Message)
+                for encoded_message in encoded_messages:
+                    await self._send_impl(encoded_message)
+                    if isinstance(encoded_message, bytes):
+                        self.logger.debug(f"Sent: {encoded_message.hex()}")
+                    else:
+                        self.logger.debug(f"Sent: {encoded_message}")
 
         except ValueError as ve:
                 self.logger.warning(f"Failed to encode message. Error {ve}")
@@ -846,13 +848,15 @@ class PythonCanAsyncIOClient(AsyncIOClient):
         for attempt in range(5):
             try:
                 await loop.run_in_executor(None, self.bus.send, encoded_message, timeout)
+                await asyncio.sleep(0.002)
                 return
             except Exception as ex:
                 if not self._is_transient_send_error(ex) or attempt == 4:
+                    self.logger.error("Failed to send message after %d attempts. Error: %s", attempt + 1, ex, exc_info=True)
                     raise
 
                 retry_delay = 0.05 * (attempt + 1)
-                self.logger.warning(
+                self.logger.debug(
                     "python-can transmit buffer full, retrying in %.2fs (attempt %d/5): %s",
                     retry_delay,
                     attempt + 1,

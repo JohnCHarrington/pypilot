@@ -7264,14 +7264,14 @@ def encode_pgn_60928(nmea2000Message: NMEA2000Message) -> bytes:
     field = nmea2000Message.get_field_by_id("deviceFunction")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Device Function'")
-    raise ValueError("Encoding 'INDIRECT_LOOKUP' not supported")
+    field_value = field.raw_value if field.raw_value is not None else field.value
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0xFF) << 40
     # spare | Offset: 48, Length: 1, Resolution: 1, Field Type: SPARE
     field = nmea2000Message.get_field_by_id("spare")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Spare'")
-    raise ValueError("Encoding 'SPARE' not supported")
+    field_value = 0 if field.value is None else field.value
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0x1) << 48
     # deviceClass | Offset: 49, Length: 7, Resolution: 1, Field Type: LOOKUP
@@ -21326,28 +21326,28 @@ def encode_pgn_126996(nmea2000Message: NMEA2000Message) -> bytes:
     field = nmea2000Message.get_field_by_id("modelId")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Model ID'")
-    raise ValueError("Encoding 'STRING_FIX' not supported")
+    field_value = encode_string_fix(field.value, 256)
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) << 32
     # softwareVersionCode | Offset: 288, Length: 256, Resolution: , Field Type: STRING_FIX
     field = nmea2000Message.get_field_by_id("softwareVersionCode")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Software Version Code'")
-    raise ValueError("Encoding 'STRING_FIX' not supported")
+    field_value = encode_string_fix(field.value, 256)
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) << 288
     # modelVersion | Offset: 544, Length: 256, Resolution: , Field Type: STRING_FIX
     field = nmea2000Message.get_field_by_id("modelVersion")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Model Version'")
-    raise ValueError("Encoding 'STRING_FIX' not supported")
+    field_value = encode_string_fix(field.value, 256)
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) << 544
     # modelSerialCode | Offset: 800, Length: 256, Resolution: , Field Type: STRING_FIX
     field = nmea2000Message.get_field_by_id("modelSerialCode")
     if field is None:
         raise ValueError("Cant encode this message, missing 'Model Serial Code'")
-    raise ValueError("Encoding 'STRING_FIX' not supported")
+    field_value = encode_string_fix(field.value, 256)
     assert isinstance(field_value, int)
     data_raw |= (field_value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) << 800
     # certificationLevel | Offset: 1056, Length: 8, Resolution: 1, Field Type: LOOKUP

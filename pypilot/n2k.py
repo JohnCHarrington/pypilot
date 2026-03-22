@@ -3,10 +3,12 @@
 # NMEA2000 bridge for pypilot
 
 import asyncio
+import hashlib
 import multiprocessing
 import select
 import threading
 import time
+import version
 
 from client import pypilotClient
 from nonblockingpipe import NonBlockingPipe
@@ -17,6 +19,10 @@ import logging
 import nmea2000
 
 log = logging.getLogger('n2k')
+
+ISO_REQUEST_PGN = 59904
+ISO_ADDRESS_CLAIM_PGN = 60928
+PRODUCT_INFORMATION_PGN = 126996
 
 
 class N2KBridge(object):
@@ -85,6 +91,7 @@ class N2KBridge(object):
         self.fd_to_source = {}
         self.msgs = {}
         self.n2k_times = {}
+        self.n2k_response_times = {}
         self.last_imu_time = time.monotonic()
         self.gps_devices = {}
         self.nav_devices = {}
@@ -127,6 +134,61 @@ class N2KBridge(object):
         return (self.n2k_transport.value, self.n2k_interface.value, self.n2k_host.value,
                 int(self.n2k_port.value or 0), self.n2k_usb_device.value, pgn_filters)
 
+    def transport_include_pgns(self):
+        pgn_filters = self.pgn_filters.value
+        if not isinstance(pgn_filters, list):
+            pgn_filters = []
+
+        include_pgns = list(pgn_filters)
+        for required_pgn in [ISO_REQUEST_PGN]:
+            if required_pgn not in include_pgns:
+                include_pgns.append(required_pgn)
+        return include_pgns
+
+    def claim_unique_number(self):
+        identity = '%s:%s' % (self.n2k_name.value, self.n2k_address.value)
+        unique_number = int(hashlib.sha1(identity.encode('utf-8')).hexdigest()[:8], 16) & 0x1fffff
+        return unique_number or 1
+
+    def build_iso_address_claim_message(self):
+        fields = [
+            nmea2000.NMEA2000Field(id='uniqueNumber', value=self.claim_unique_number()),
+            nmea2000.NMEA2000Field(id='manufacturerCode', value='Diverse Yacht Services'),
+            nmea2000.NMEA2000Field(id='deviceInstanceLower', value=0),
+            nmea2000.NMEA2000Field(id='deviceInstanceUpper', value=0),
+            nmea2000.NMEA2000Field(id='deviceFunction', value='Autopilot', raw_value=150),
+            nmea2000.NMEA2000Field(id='spare', value=0),
+            nmea2000.NMEA2000Field(id='deviceClass', value='Steering and Control surfaces'),
+            nmea2000.NMEA2000Field(id='systemInstance', value=0),
+            nmea2000.NMEA2000Field(id='industryGroup', value='Marine', raw_value=4),
+            nmea2000.NMEA2000Field(id='arbitraryAddressCapable', value='Yes', raw_value=1),
+        ]
+        return nmea2000.NMEA2000Message(
+            PGN=ISO_ADDRESS_CLAIM_PGN,
+            source=self.n2k_address.value,
+            destination=255,
+            priority=6,
+            fields=fields)
+
+    def build_product_information_message(self):
+        unique_number = self.claim_unique_number()
+        fields = [
+            nmea2000.NMEA2000Field(id='nmea2000Version', value=2.0),
+            nmea2000.NMEA2000Field(id='productCode', value=1300),
+            nmea2000.NMEA2000Field(id='modelId', value=self.n2k_name.value or 'pypilot'),
+            nmea2000.NMEA2000Field(id='softwareVersionCode', value=version.strversion),
+            nmea2000.NMEA2000Field(id='modelVersion', value='Autopilot'),
+            nmea2000.NMEA2000Field(id='modelSerialCode', value='%08X' % unique_number),
+            nmea2000.NMEA2000Field(id='certificationLevel', value='Level B'),
+            nmea2000.NMEA2000Field(id='loadEquivalency', value=1),
+        ]
+        return nmea2000.NMEA2000Message(
+            PGN=PRODUCT_INFORMATION_PGN,
+            source=self.n2k_address.value,
+            destination=255,
+            priority=6,
+            fields=fields)
+
     async def init_transport(self):
         print("N2KBridge: Initializing transport...")
         await self.close_gateway()
@@ -137,8 +199,10 @@ class N2KBridge(object):
             self.set_status('disabled')
             return
 
+        include_pgns = self.transport_include_pgns()
+
         transport_classes = {
-            'socketcan': (nmea2000.PythonCanAsyncIOClient, {"interface": "socketcan", "channel": self.n2k_interface.value or "can0", "include_pgns": self.pgn_filters.value}),
+            'socketcan': (nmea2000.PythonCanAsyncIOClient, {"interface": "socketcan", "channel": self.n2k_interface.value or "can0", "include_pgns": include_pgns}),
             'actisense': (nmea2000.ActisenseNmea2000Gateway, {}),
             'ebyte': (nmea2000.EByteNmea2000Gateway, {}),
             'usb': (nmea2000.WaveShareNmea2000Gateway, {}),
@@ -153,6 +217,7 @@ class N2KBridge(object):
         try:
             self.gateway = transport_class(**transport_kwargs)
             await self.gateway.connect()
+            await self.send_message(self.build_iso_address_claim_message())
         except Exception as e:
             self.set_status('transport error', str(e))
             return
@@ -242,6 +307,30 @@ class N2KBridge(object):
 
     def parse_pgn(self, message: nmea2000.NMEA2000Message):
         device = 'N2K%d' % message.source if message.source is not None else 'N2K'
+        self.all_pgns = self.all_pgns if hasattr(self, 'all_pgns') else set()
+        self.all_pgns.add(message.PGN)
+        print(self.all_pgns)
+
+        if message.PGN == ISO_REQUEST_PGN:
+            try:
+                requested_pgn = message.get_field_by_id('pgn').value
+            except Exception:
+                return
+
+            if message.destination not in [self.n2k_address.value, 255]:
+                return
+
+            if requested_pgn == ISO_ADDRESS_CLAIM_PGN:
+                asyncio.create_task(self.send_message(self.build_iso_address_claim_message()))
+            elif requested_pgn == PRODUCT_INFORMATION_PGN:
+                now = time.monotonic()
+                last_response = self.n2k_response_times.get(PRODUCT_INFORMATION_PGN, 0)
+                if now - last_response >= 2.0:
+                    self.n2k_response_times[PRODUCT_INFORMATION_PGN] = now
+                    asyncio.create_task(self.send_message(self.build_product_information_message()))
+            else:
+                print("Received request for PGN %d, but no handler is implemented" % requested_pgn)
+            return
 
         if message.PGN == 130306:
             try:
@@ -437,98 +526,6 @@ class N2KBridge(object):
                     await self.send_message(message)
 
                 self.last_imu_time = t
-
-        for name in ['wind', 'truewind', 'rudder']:
-            source = self.last_values.get(name + '.source', 'none')
-            if source_priority.get(source, 7) <= source_priority['can']:
-                continue
-
-            last_time = self.n2k_times.get(name, 0)
-            dt = t - last_time if last_time else 1
-            freq = 1.0 / dt if dt > 0 else 999
-            rate = values.get(name + '.rate', None)
-            rate_val = rate or 4
-            if freq >= rate_val:
-                continue
-
-            if name == 'wind' and 'wind.direction' in values and 'wind.speed' in values:
-                direction_rad = values['wind.direction'] * 3.141592653589793 / 180.0
-                speed_ms = values['wind.speed'] / 1.94384
-                # PGN 130306 requires: sid, windSpeed, windAngle, reference, reserved_43
-                fields = [
-                    nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
-                    nmea2000.NMEA2000Field(id='windSpeed', value=speed_ms),
-                    nmea2000.NMEA2000Field(id='windAngle', value=direction_rad),
-                    nmea2000.NMEA2000Field(id='reference', value='Apparent'),
-                    nmea2000.NMEA2000Field(id='reserved_43', value=0),
-                ]
-                message = nmea2000.NMEA2000Message(PGN=130306, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-            elif name == 'truewind' and 'truewind.direction' in values and 'truewind.speed' in values:
-                direction_rad = values['truewind.direction'] * 3.141592653589793 / 180.0
-                speed_ms = values['truewind.speed'] / 1.94384
-                fields = [
-                    nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
-                    nmea2000.NMEA2000Field(id='windSpeed', value=speed_ms),
-                    nmea2000.NMEA2000Field(id='windAngle', value=direction_rad),
-                    nmea2000.NMEA2000Field(id='reference', value='True'),
-                    nmea2000.NMEA2000Field(id='reserved_43', value=0),
-                ]
-                message = nmea2000.NMEA2000Message(PGN=130306, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-            elif name == 'rudder' and 'rudder.angle' in values:
-                angle_rad = -values['rudder.angle'] * 3.141592653589793 / 180.0
-                # PGN 127245 requires: instance, directionOrder, reserved_11, angleOrder, position, reserved_48
-                fields = [
-                    nmea2000.NMEA2000Field(id='instance', value=0),
-                    nmea2000.NMEA2000Field(id='directionOrder', value='No Order'),
-                    nmea2000.NMEA2000Field(id='reserved_11', value=0),
-                    nmea2000.NMEA2000Field(id='angleOrder', value=0.0),
-                    nmea2000.NMEA2000Field(id='position', value=angle_rad),
-                    nmea2000.NMEA2000Field(id='reserved_48', value=0),
-                ]
-                message = nmea2000.NMEA2000Message(PGN=127245, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-
-            period = 1.0 / rate_val if rate_val > 0 else 0.25
-            self.n2k_times[name] = max(min(last_time + period, t + period), t)
-
-        # Control PGN output removed: only sensor data outputs are sent (heading/attitude/rotor/wind/rudder/gps)
-
-        if self.n2k_output_enable['gps_filtered'].value and self.last_values.get('gps.filtered.fix'):
-            fix = self.last_values['gps.filtered.fix']
-            self.last_values['gps.filtered.fix'] = False
-            try:
-                lat = fix['lat']
-                lon = fix['lon']
-                speed = fix['speed']
-                track = fix['track']
-                timestamp = fix['timestamp']
-                sog_ms = speed / 1.94384
-                cog_rad = (track if track > 0 else 360 + track) * 3.141592653589793 / 180.0
-                # Use PGN 129025 (Position, Rapid Update) for simple lat/lon output
-                fields = [nmea2000.NMEA2000Field(id=key, value=value) for key, value in ({'latitude': lat, 'longitude': lon}).items()]
-                fields.append(nmea2000.NMEA2000Field(id='sid', value=self.next_sid()))
-                message = nmea2000.NMEA2000Message(PGN=129025, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-                # Build PGN 129026 (COG & SOG, Rapid Update) with required fields
-                fields = [
-                    nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
-                    nmea2000.NMEA2000Field(id='cogReference', value='True'),
-                    nmea2000.NMEA2000Field(id='reserved_10', value=0),
-                    nmea2000.NMEA2000Field(id='cog', value=cog_rad),
-                    nmea2000.NMEA2000Field(id='sog', value=sog_ms),
-                    nmea2000.NMEA2000Field(id='reserved_48', value=0),
-                ]
-                message = nmea2000.NMEA2000Message(PGN=129026, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-                # PGN 129033 (Time & Date) - include time and SID
-                fields = [nmea2000.NMEA2000Field(id='time', value=timestamp)]
-                fields.append(nmea2000.NMEA2000Field(id='sid', value=self.next_sid()))
-                message = nmea2000.NMEA2000Message(PGN=129033, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
-                await self.send_message(message)
-            except Exception as e:
-                self.set_status('gps output error', str(e))
 
     async def poll(self, timeout=100):
         await self.ensure_transport() 
