@@ -334,6 +334,20 @@ def decode_string_fix(data_raw: int, bit_offset: int, bit_length: int) -> str:
     decoded_str = decoded_str.split('@', 1)[0]
     decoded_str = decoded_str.strip()
     return decoded_str
+
+def encode_string_fix(value: str | bytes | None, bit_length: int) -> int:
+    num_bytes = (bit_length + 7) // 8
+    if value is None:
+        return 0
+
+    if isinstance(value, bytes):
+        encoded = value
+    else:
+        encoded = value.encode('utf-8', errors='ignore')
+
+    encoded = encoded[:num_bytes]
+    encoded = encoded.ljust(num_bytes, b'\x00')
+    return int.from_bytes(encoded, 'little')
     
 def decode_string_lz(data_raw: int, bit_offset: int) -> str:
     data_raw = data_raw >> bit_offset
