@@ -18,6 +18,9 @@ class NMEA2000Encoder:
         self.sequence_counter = 0
 
     def _call_encode_function(self, nmea200_message: NMEA2000Message) -> bytes:
+        if isinstance(nmea200_message.raw_can_data, bytes):
+            return nmea200_message.raw_can_data
+
         encode_func_name = f'encode_pgn_{nmea200_message.PGN}'
         encode_func: Callable[[NMEA2000Message], bytes] | None = getattr(pgns_module, encode_func_name, None)
 
