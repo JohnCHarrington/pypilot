@@ -11,29 +11,11 @@ import time, socket, multiprocessing, os
 from nonblockingpipe import NonBlockingPipe
 import pyjson
 from client import pypilotClient
+from signalk_table import meters_s, radians, signalk_table
 from values import Property, RangeProperty, BooleanProperty
 from sensors import source_priority
 
 signalk_priority = source_priority['signalk']
-radians = 3.141592653589793/180
-meters_s = 0.5144456333854638
-        
-# provide bi-directional translation of these keys
-signalk_table = {'wind': {('environment.wind.speedApparent', meters_s): 'speed',
-                          ('environment.wind.angleApparent', radians): 'direction'},
-                 'truewind': {('environment.wind.speedTrue', meters_s): 'speed',
-                              ('environment.wind.angleTrue', radians): 'direction'},
-                 'gps': {('navigation.courseOverGroundTrue', radians): 'track',
-                         ('navigation.speedOverGround', meters_s): 'speed',
-                         ('navigation.position', 1): {'latitude': 'lat',
-                                                      'longitude': 'lon'}},
-                 'rudder': {('steering.rudderAngle', -radians): 'angle'},
-                 'apb': {('steering.autopilot.target.headingTrue', radians): 'track'},
-                 'imu': {('navigation.headingMagnetic', radians): 'heading_lowpass',
-                         ('navigation.attitude', radians): {'pitch': 'pitch', 'roll': 'roll', 'yaw': 'heading_lowpass'},
-                         ('navigation.rateOfTurn', radians): 'headingrate_lowpass'},
-                 'water': {('navigation.speedThroughWater', meters_s): 'speed',
-                           ('navigation.leewayAngle', radians): 'leeway'}}
 
 token_path = os.getenv('HOME') + '/.pypilot/signalk-token'
 

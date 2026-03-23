@@ -1,0 +1,20 @@
+{
+  "name": "pypilot-n2k-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "canboatjs and n2k-signalk worker for pypilot",
+  "main": "index.js",
+  "bin": {
+    "pypilot-n2k-worker": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@canboat/canboatjs": "^8.2.0",
+    "n2k-signalk": "^4.16.2"
+  }
+}

@@ -167,7 +167,7 @@ class Autopilot(object):
 
         # setup all processes to exit on any signal
         self.childprocesses = [self.boatimu.imu, self.boatimu.auto_cal,
-                               self.sensors.nmea, self.sensors.gpsd, self.sensors.gps.filtered,
+                               self.sensors.nmea, self.sensors.n2k, self.sensors.gpsd, self.sensors.gps.filtered,
                                self.sensors.signalk, self.server]
         def cleanup(signal_number, frame=None):
             #print('got signal', signal_number, 'cleaning up')

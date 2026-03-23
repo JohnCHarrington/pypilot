@@ -16,6 +16,10 @@ You could install the dependencies with the following command:
 sudo python3 setup.py install
 ```
 
+The canboatjs-based NMEA 2000 bridge also needs a local Node.js runtime and the
+worker dependencies installed from [n2k_worker/README.md](n2k_worker/README.md).
+The Python side supervises that worker through [pypilot/n2k.py](pypilot/n2k.py).
+
 ### Configuration
 
 You may want to run pypilot as a service, see the scripts/debian directory
@@ -24,6 +28,16 @@ You may want to run pypilot as a service, see the scripts/debian directory
 
 Most of the scripts can be run individually as standalone 
 or test programs, some function as clients, other as servers
+
+### NMEA 2000 Worker
+
+The experimental NMEA 2000 path uses a repo-local JavaScript worker in
+[n2k_worker](n2k_worker) built on canboatjs and n2k-signalk.
+
+- Install it with `cd n2k_worker && npm install`
+- Enable it in pypilot with the `n2k.enabled` value
+- Configure the SocketCAN device with `n2k.interface`
+- Override the worker command with `n2k.canboatjs.command` if needed
 
 ### servers (only one executes at a time)
 
