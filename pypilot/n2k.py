@@ -5,6 +5,7 @@
 import asyncio
 import hashlib
 import multiprocessing
+import random
 import select
 import threading
 import time
@@ -22,7 +23,27 @@ log = logging.getLogger('n2k')
 
 ISO_REQUEST_PGN = 59904
 ISO_ADDRESS_CLAIM_PGN = 60928
+ISO_ACKNOWLEDGEMENT_PGN = 59392
+GROUP_FUNCTION_PGN = 126208
+HEARTBEAT_PGN = 126993
 PRODUCT_INFORMATION_PGN = 126996
+CONFIGURATION_INFORMATION_PGN = 126998
+PGN_LIST_PGN = 126464
+
+STARTUP_ADDRESS_CLAIM_SOURCE = 254
+ADDRESS_CLAIM_DETECTION_TIME = 5.0
+HEARTBEAT_INTERVAL = 60.0
+TRANSMIT_PGN_LIST_FUNCTION = 0
+
+BASE_TRANSMIT_PGNS = [
+    ISO_REQUEST_PGN,
+    ISO_ADDRESS_CLAIM_PGN,
+    ISO_ACKNOWLEDGEMENT_PGN,
+    HEARTBEAT_PGN,
+    PRODUCT_INFORMATION_PGN,
+    CONFIGURATION_INFORMATION_PGN,
+    PGN_LIST_PGN,
+]
 
 
 class N2KBridge(object):
@@ -53,6 +74,7 @@ class N2KBridge(object):
         self.n2k_usb_device = self.client.register(Property('n2k.usb_device', '', persistent=True))
         self.n2k_address = self.client.register(Property('n2k.address', 25, persistent=True))
         self.n2k_name = self.client.register(Property('n2k.name', 'pypilot', persistent=True))
+        self.n2k_unique_number = self.client.register(Property('n2k.unique_number', 0, persistent=True))
         self.n2k_status = self.client.register(StringValue('n2k.status', 'initializing'))
         self.n2k_error = self.client.register(StringValue('n2k.error', ''))
 
@@ -96,6 +118,17 @@ class N2KBridge(object):
         self.gps_devices = {}
         self.nav_devices = {}
         self.n2k_sid = 0
+        self.devices = {}
+        self.cansend = False
+        self.claim_in_progress = False
+        self.found_conflict = False
+        self.address_claim_sent_at = 0.0
+        self.heartbeat_counter = 0
+        self.next_heartbeat_time = 0.0
+
+        if not self.n2k_unique_number.value:
+            unique_number = random.getrandbits(21) & 0x1fffff
+            self.n2k_unique_number.set(unique_number or 1)
 
         self.setup_watches()
         await self.init_transport()
@@ -140,15 +173,273 @@ class N2KBridge(object):
             pgn_filters = []
 
         include_pgns = list(pgn_filters)
-        for required_pgn in [ISO_REQUEST_PGN]:
+        for required_pgn in [ISO_REQUEST_PGN, ISO_ADDRESS_CLAIM_PGN, GROUP_FUNCTION_PGN]:
             if required_pgn not in include_pgns:
                 include_pgns.append(required_pgn)
         return include_pgns
 
     def claim_unique_number(self):
-        identity = '%s:%s' % (self.n2k_name.value, self.n2k_address.value)
-        unique_number = int(hashlib.sha1(identity.encode('utf-8')).hexdigest()[:8], 16) & 0x1fffff
-        return unique_number or 1
+        unique_number = int(self.n2k_unique_number.value or 0) & 0x1fffff
+        if not unique_number:
+            identity = '%s:%s:%s' % (self.n2k_name.value, self.n2k_address.value, time.time_ns())
+            unique_number = int(hashlib.sha1(identity.encode('utf-8')).hexdigest()[:8], 16) & 0x1fffff
+            unique_number = unique_number or 1
+            self.n2k_unique_number.set(unique_number)
+        return unique_number
+
+    def get_iso_name_value(self, address=None):
+        if address is None:
+            address = int(self.n2k_address.value)
+        unique_number = self.claim_unique_number() & 0x1fffff
+        manufacturer_code = 78
+        device_instance_lower = 0
+        device_instance_upper = 0
+        device_function = 150
+        spare = 0
+        device_class = 40
+        system_instance = 0
+        industry_group = 4
+        arbitrary_address_capable = 1
+
+        return (
+            unique_number
+            | (manufacturer_code << 21)
+            | (device_instance_lower << 32)
+            | (device_instance_upper << 35)
+            | (device_function << 40)
+            | (spare << 48)
+            | (device_class << 49)
+            | (system_instance << 56)
+            | (industry_group << 60)
+            | (arbitrary_address_capable << 63)
+        )
+
+    def get_iso_name_value_from_message(self, message):
+        try:
+            unique_number = int(message.get_field_by_id('uniqueNumber').raw_value)
+            manufacturer_code = int(message.get_field_by_id('manufacturerCode').raw_value)
+            device_instance_lower = int(message.get_field_by_id('deviceInstanceLower').raw_value)
+            device_instance_upper = int(message.get_field_by_id('deviceInstanceUpper').raw_value)
+            device_function = int(message.get_field_by_id('deviceFunction').raw_value)
+            spare = int(message.get_field_by_id('spare').raw_value)
+            device_class = int(message.get_field_by_id('deviceClass').raw_value)
+            system_instance = int(message.get_field_by_id('systemInstance').raw_value)
+            industry_group = int(message.get_field_by_id('industryGroup').raw_value)
+            arbitrary_address_capable = int(message.get_field_by_id('arbitraryAddressCapable').raw_value)
+        except Exception:
+            return None
+
+        return (
+            unique_number
+            | (manufacturer_code << 21)
+            | (device_instance_lower << 32)
+            | (device_instance_upper << 35)
+            | (device_function << 40)
+            | (spare << 48)
+            | (device_class << 49)
+            | (system_instance << 56)
+            | (industry_group << 60)
+            | (arbitrary_address_capable << 63)
+        )
+
+    def build_lau_string(self, value):
+        if value is None:
+            value = ''
+        encoded = str(value).encode('utf-8', errors='ignore')
+        return bytes([len(encoded) + 2, 1]) + encoded
+
+    def build_configuration_information_payload(self):
+        transport = self.n2k_transport.value
+        details = self.n2k_interface.value or self.n2k_host.value or self.n2k_usb_device.value or ''
+        install_1 = '%s:%s' % (transport, details) if details else str(transport)
+        install_2 = '%s autopilot' % (self.n2k_name.value or 'pypilot')
+        manufacturer_information = 'pypilot %s' % version.strversion
+        return (
+            self.build_lau_string(install_1)
+            + self.build_lau_string(install_2)
+            + self.build_lau_string(manufacturer_information)
+        )
+
+    def build_configuration_information_message(self):
+        return nmea2000.NMEA2000Message(
+            PGN=CONFIGURATION_INFORMATION_PGN,
+            source=self.n2k_address.value,
+            destination=255,
+            priority=6,
+            raw_can_data=self.build_configuration_information_payload())
+
+    def get_transmit_pgns(self):
+        pgns = list(BASE_TRANSMIT_PGNS)
+        if self.n2k_output_enable['attitude'].value:
+            pgns.append(127257)
+        if self.n2k_output_enable['heading'].value:
+            pgns.append(127250)
+        if self.n2k_output_enable['rate_of_turn'].value:
+            pgns.append(127251)
+        return sorted(set(pgns))
+
+    def build_transmit_pgn_list_message(self, destination):
+        payload = bytearray([TRANSMIT_PGN_LIST_FUNCTION])
+        for pgn in self.get_transmit_pgns():
+            payload.extend(int(pgn).to_bytes(3, byteorder='little', signed=False))
+        return nmea2000.NMEA2000Message(
+            PGN=PGN_LIST_PGN,
+            source=self.n2k_address.value,
+            destination=destination,
+            priority=6,
+            raw_can_data=bytes(payload))
+
+    def build_heartbeat_message(self):
+        return nmea2000.NMEA2000Message(
+            PGN=HEARTBEAT_PGN,
+            source=self.n2k_address.value,
+            destination=255,
+            priority=6,
+            fields=[
+                nmea2000.NMEA2000Field(id='dataTransmitOffset', raw_value=60.0),
+                nmea2000.NMEA2000Field(id='sequenceCounter', value=self.heartbeat_counter),
+                nmea2000.NMEA2000Field(id='controller1State', value='Error Active'),
+                nmea2000.NMEA2000Field(id='controller2State', value='Error Active'),
+                nmea2000.NMEA2000Field(id='equipmentStatus', value='Operational'),
+                nmea2000.NMEA2000Field(id='reserved_30', value=0),
+            ])
+
+    def build_iso_request_message(self, pgn, source=None, destination=255):
+        if source is None:
+            source = self.n2k_address.value
+        return nmea2000.NMEA2000Message(
+            PGN=ISO_REQUEST_PGN,
+            source=source,
+            destination=destination,
+            priority=6,
+            fields=[nmea2000.NMEA2000Field(id='pgn', value=int(pgn))])
+
+    def build_iso_acknowledgement_message(self, destination, requested_pgn, control='NAK'):
+        return nmea2000.NMEA2000Message(
+            PGN=ISO_ACKNOWLEDGEMENT_PGN,
+            source=self.n2k_address.value,
+            destination=destination,
+            priority=6,
+            fields=[
+                nmea2000.NMEA2000Field(id='control', value=control),
+                nmea2000.NMEA2000Field(id='groupFunction', value=255),
+                nmea2000.NMEA2000Field(id='reserved_16', value=0),
+                nmea2000.NMEA2000Field(id='pgn', value=int(requested_pgn)),
+            ])
+
+    def build_group_function_acknowledgement(self, destination, requested_pgn):
+        return nmea2000.NMEA2000Message(
+            PGN=GROUP_FUNCTION_PGN,
+            id='nmeaAcknowledgeGroupFunction',
+            source=self.n2k_address.value,
+            destination=destination,
+            priority=6,
+            fields=[
+                nmea2000.NMEA2000Field(id='functionCode', value='Acknowledge'),
+                nmea2000.NMEA2000Field(id='pgn', value=int(requested_pgn)),
+                nmea2000.NMEA2000Field(id='pgnErrorCode', value='Not supported'),
+                nmea2000.NMEA2000Field(id='transmissionIntervalPriorityErrorCode', value='Acknowledge'),
+                nmea2000.NMEA2000Field(id='numberOfParameters', value=0),
+                nmea2000.NMEA2000Field(id='parameter', value='Acknowledge'),
+            ])
+
+    def register_device(self, message):
+        if message.source is None:
+            return
+        self.devices[message.source] = {'addressClaim': message, 'seen': time.monotonic()}
+
+    def increase_address(self):
+        start = int(self.n2k_address.value)
+        address = start
+        while True:
+            address = (address + 1) % 253
+            if address == start:
+                break
+            if address not in self.devices:
+                self.n2k_address.set(address)
+                return address
+        return int(self.n2k_address.value)
+
+    async def send_address_claim(self):
+        if self.n2k_address.value in self.devices:
+            self.increase_address()
+        self.cansend = False
+        self.claim_in_progress = True
+        self.address_claim_sent_at = time.monotonic()
+        await self.send_message(self.build_iso_address_claim_message())
+        self.set_status('claiming address %d' % self.n2k_address.value)
+
+    async def finish_address_claim(self):
+        self.claim_in_progress = False
+        self.cansend = True
+        self.next_heartbeat_time = time.monotonic() + HEARTBEAT_INTERVAL
+        self.set_status('Claimed address %d (pypilot %s)' % (self.n2k_address.value, version.strversion))
+
+    async def startup_address_claim(self):
+        await self.send_message(self.build_iso_request_message(ISO_ADDRESS_CLAIM_PGN, STARTUP_ADDRESS_CLAIM_SOURCE))
+        await asyncio.sleep(1)
+        await self.send_address_claim()
+
+    async def handle_iso_request(self, message, requested_pgn):
+        if requested_pgn == ISO_ADDRESS_CLAIM_PGN:
+            await self.send_message(self.build_iso_address_claim_message())
+            return
+
+        if requested_pgn == PRODUCT_INFORMATION_PGN:
+            now = time.monotonic()
+            last_response = self.n2k_response_times.get(PRODUCT_INFORMATION_PGN, 0)
+            if now - last_response >= 2.0:
+                self.n2k_response_times[PRODUCT_INFORMATION_PGN] = now
+                await self.send_message(self.build_product_information_message())
+            return
+
+        if requested_pgn == CONFIGURATION_INFORMATION_PGN:
+            await self.send_message(self.build_configuration_information_message())
+            return
+
+        if requested_pgn == PGN_LIST_PGN:
+            await self.send_message(self.build_transmit_pgn_list_message(message.source or 255))
+            return
+
+        await self.send_message(
+            self.build_iso_acknowledgement_message(message.source or 255, requested_pgn))
+
+    async def handle_group_function(self, message):
+        try:
+            function_code = message.get_field_by_id('functionCode').value
+            requested_pgn = message.get_field_by_id('pgn').value
+        except Exception:
+            return
+
+        if function_code in ['Request', 'Command']:
+            await self.send_message(
+                self.build_group_function_acknowledgement(message.source or 255, requested_pgn))
+
+    async def handle_iso_address_claim(self, message):
+        if message.source is None:
+            return
+
+        if message.source != self.n2k_address.value or not (self.claim_in_progress or self.cansend):
+            self.register_device(message)
+
+        if message.source != self.n2k_address.value:
+            return
+
+        if not (self.claim_in_progress or self.cansend):
+            return
+
+        their_name = self.get_iso_name_value_from_message(message)
+        our_name = self.get_iso_name_value()
+        if their_name is None or their_name == our_name:
+            return
+
+        if our_name < their_name:
+            await self.send_address_claim()
+            return
+
+        self.found_conflict = True
+        self.increase_address()
+        await self.send_address_claim()
 
     def build_iso_address_claim_message(self):
         fields = [
@@ -217,7 +508,11 @@ class N2KBridge(object):
         try:
             self.gateway = transport_class(**transport_kwargs)
             await self.gateway.connect()
-            await self.send_message(self.build_iso_address_claim_message())
+            self.devices = {}
+            self.cansend = False
+            self.claim_in_progress = False
+            self.found_conflict = False
+            await self.startup_address_claim()
         except Exception as e:
             self.set_status('transport error', str(e))
             return
@@ -311,6 +606,10 @@ class N2KBridge(object):
         self.all_pgns.add(message.PGN)
         print(self.all_pgns)
 
+        if message.PGN == ISO_ADDRESS_CLAIM_PGN:
+            asyncio.create_task(self.handle_iso_address_claim(message))
+            return
+
         if message.PGN == ISO_REQUEST_PGN:
             try:
                 requested_pgn = message.get_field_by_id('pgn').value
@@ -320,16 +619,11 @@ class N2KBridge(object):
             if message.destination not in [self.n2k_address.value, 255]:
                 return
 
-            if requested_pgn == ISO_ADDRESS_CLAIM_PGN:
-                asyncio.create_task(self.send_message(self.build_iso_address_claim_message()))
-            elif requested_pgn == PRODUCT_INFORMATION_PGN:
-                now = time.monotonic()
-                last_response = self.n2k_response_times.get(PRODUCT_INFORMATION_PGN, 0)
-                if now - last_response >= 2.0:
-                    self.n2k_response_times[PRODUCT_INFORMATION_PGN] = now
-                    asyncio.create_task(self.send_message(self.build_product_information_message()))
-            else:
-                print("Received request for PGN %d, but no handler is implemented" % requested_pgn)
+            asyncio.create_task(self.handle_iso_request(message, requested_pgn))
+            return
+
+        if message.PGN == GROUP_FUNCTION_PGN and message.destination in [self.n2k_address.value, 255]:
+            asyncio.create_task(self.handle_group_function(message))
             return
 
         if message.PGN == 130306:
@@ -479,10 +773,27 @@ class N2KBridge(object):
     def publish_msgs(self):
         if self.msgs and self.pipe.send(self.msgs):
             self.msgs = {}
+
+    async def update_claim_state(self):
+        if self.claim_in_progress and time.monotonic() - self.address_claim_sent_at >= ADDRESS_CLAIM_DETECTION_TIME:
+            await self.finish_address_claim()
+
+    async def send_heartbeat_if_due(self, now):
+        if not self.cansend or not self.next_heartbeat_time or now < self.next_heartbeat_time:
+            return
+
+        self.heartbeat_counter = (self.heartbeat_counter + 1) % 253
+        await self.send_message(self.build_heartbeat_message())
+        self.next_heartbeat_time = now + HEARTBEAT_INTERVAL
     
     async def output_pgns(self):
+        if not self.cansend:
+            return
+
         values = self.last_values
         t = time.monotonic()
+
+        await self.send_heartbeat_if_due(t)
 
         if self.n2k_output_enable['attitude'].value or self.n2k_output_enable['heading'].value or self.n2k_output_enable['rate_of_turn'].value:
             if t - self.last_imu_time > 0.1:
@@ -505,7 +816,7 @@ class N2KBridge(object):
                     # Include required PGN 127250 fields: sid, heading, deviation, variation, reference, reserved_58
                     fields = [
                         nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
-                        nmea2000.NMEA2000Field(id='heading', value=163 * 3.141592653589793 / 180.0),  # Placeholder value, replace with actual heading in radians
+                        nmea2000.NMEA2000Field(id='heading', value=heading_rad),
                         nmea2000.NMEA2000Field(id='deviation', value=0.0),
                         nmea2000.NMEA2000Field(id='variation', value=0.0),
                         nmea2000.NMEA2000Field(id='reference', value='Magnetic'),
@@ -530,9 +841,14 @@ class N2KBridge(object):
     async def poll(self, timeout=100):
         await self.ensure_transport() 
 
+        await self.update_claim_state()
+
         if self.gateway:
-            data = await self.gateway.queue.get()
-            self.parse_pgn(data)
+            try:
+                data = await asyncio.wait_for(self.gateway.queue.get(), timeout / 1000.0)
+                self.parse_pgn(data)
+            except asyncio.TimeoutError:
+                pass
 
         self.publish_msgs()
 
