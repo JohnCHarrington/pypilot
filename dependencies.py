@@ -55,6 +55,8 @@ class py_dep(dep):
                 name = 'pillow'
             elif self.name == 'flask-socketio':
                 name = 'flask-socketio==5'
+            elif self.name == 'nmea2000':
+                name = 'git+https://github.com/johncharrington/nmea2000/python-3.8-compat.git'
             else:
                 name = self.name
             ret = os.system('sudo python3 -m pip install ' + name)
@@ -133,7 +135,7 @@ class RTIMULIB2_dep(dep):
         return True
 
     def install(self):
-        return os.system('. scripts/install_rtimulib.sh') == 0
+        os.system('sudo python3 -m pip install git+https://github.com/johncharrington/nmea2000/python-3.8-compat.git')
 
 class data_dep(dep):
     def __init__(self):
@@ -144,6 +146,7 @@ class data_dep(dep):
 
     def install(self):
         return os.system('. scripts/install_data.sh') == 0
+
 
 class subsystem(object):
     def __init__(self, name, info, deps):
@@ -193,7 +196,7 @@ ss('optimize', '(recommended) core autopilot operations',
    [py_dep('ujson'), py_dep('pyudev'), py_dep('inotify')])
 
 ss('nmea2000', 'nmea2000 support',
-   [py_dep('pyserial-asyncio'), py_dep('python-can'), py_dep('tenacity')])
+   [py_dep('nmea2000')])
 
 # signalk dependencies: python3-zerconf python3-requests python3-websocket
 ss('signalk', 'communicate with signalk-node-server distributed with openploter',
