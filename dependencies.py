@@ -135,7 +135,7 @@ class RTIMULIB2_dep(dep):
         return True
 
     def install(self):
-        os.system('sudo python3 -m pip install git+https://github.com/johncharrington/nmea2000/python-3.8-compat.git')
+        os.system('sudo python3 -m pip install git+https://github.com/johncharrington/nmea2000.git@python-3.8-compat')
 
 class data_dep(dep):
     def __init__(self):
