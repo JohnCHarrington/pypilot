@@ -278,207 +278,6 @@ class N2KBridge(object):
             pgns.append(127251)
         return sorted(set(pgns))
 
-    def build_transmit_pgn_list_message(self, destination):
-        payload = bytearray([TRANSMIT_PGN_LIST_FUNCTION])
-        for pgn in self.get_transmit_pgns():
-            payload.extend(int(pgn).to_bytes(3, byteorder='little', signed=False))
-        return nmea2000.NMEA2000Message(
-            PGN=PGN_LIST_PGN,
-            source=self.n2k_address.value,
-            destination=destination,
-            priority=6,
-            raw_can_data=bytes(payload))
-
-    def build_heartbeat_message(self):
-        return nmea2000.NMEA2000Message(
-            PGN=HEARTBEAT_PGN,
-            source=self.n2k_address.value,
-            destination=255,
-            priority=6,
-            fields=[
-                nmea2000.NMEA2000Field(id='dataTransmitOffset', raw_value=60.0),
-                nmea2000.NMEA2000Field(id='sequenceCounter', value=self.heartbeat_counter),
-                nmea2000.NMEA2000Field(id='controller1State', value='Error Active'),
-                nmea2000.NMEA2000Field(id='controller2State', value='Error Active'),
-                nmea2000.NMEA2000Field(id='equipmentStatus', value='Operational'),
-                nmea2000.NMEA2000Field(id='reserved_30', value=0),
-            ])
-
-    def build_iso_request_message(self, pgn, source=None, destination=255):
-        if source is None:
-            source = self.n2k_address.value
-        return nmea2000.NMEA2000Message(
-            PGN=ISO_REQUEST_PGN,
-            source=source,
-            destination=destination,
-            priority=6,
-            fields=[nmea2000.NMEA2000Field(id='pgn', value=int(pgn))])
-
-    def build_iso_acknowledgement_message(self, destination, requested_pgn, control='NAK'):
-        return nmea2000.NMEA2000Message(
-            PGN=ISO_ACKNOWLEDGEMENT_PGN,
-            source=self.n2k_address.value,
-            destination=destination,
-            priority=6,
-            fields=[
-                nmea2000.NMEA2000Field(id='control', value=control),
-                nmea2000.NMEA2000Field(id='groupFunction', value=255),
-                nmea2000.NMEA2000Field(id='reserved_16', value=0),
-                nmea2000.NMEA2000Field(id='pgn', value=int(requested_pgn)),
-            ])
-
-    def build_group_function_acknowledgement(self, destination, requested_pgn):
-        return nmea2000.NMEA2000Message(
-            PGN=GROUP_FUNCTION_PGN,
-            id='nmeaAcknowledgeGroupFunction',
-            source=self.n2k_address.value,
-            destination=destination,
-            priority=6,
-            fields=[
-                nmea2000.NMEA2000Field(id='functionCode', value='Acknowledge'),
-                nmea2000.NMEA2000Field(id='pgn', value=int(requested_pgn)),
-                nmea2000.NMEA2000Field(id='pgnErrorCode', value='Not supported'),
-                nmea2000.NMEA2000Field(id='transmissionIntervalPriorityErrorCode', value='Acknowledge'),
-                nmea2000.NMEA2000Field(id='numberOfParameters', value=0),
-                nmea2000.NMEA2000Field(id='parameter', value='Acknowledge'),
-            ])
-
-    def register_device(self, message):
-        if message.source is None:
-            return
-        self.devices[message.source] = {'addressClaim': message, 'seen': time.monotonic()}
-
-    def increase_address(self):
-        start = int(self.n2k_address.value)
-        address = start
-        while True:
-            address = (address + 1) % 253
-            if address == start:
-                break
-            if address not in self.devices:
-                self.n2k_address.set(address)
-                return address
-        return int(self.n2k_address.value)
-
-    async def send_address_claim(self):
-        if self.n2k_address.value in self.devices:
-            self.increase_address()
-        self.cansend = False
-        self.claim_in_progress = True
-        self.address_claim_sent_at = time.monotonic()
-        await self.send_message(self.build_iso_address_claim_message())
-        self.set_status('claiming address %d' % self.n2k_address.value)
-
-    async def finish_address_claim(self):
-        self.claim_in_progress = False
-        self.cansend = True
-        self.next_heartbeat_time = time.monotonic() + HEARTBEAT_INTERVAL
-        self.set_status('Claimed address %d (pypilot %s)' % (self.n2k_address.value, version.strversion))
-
-    async def startup_address_claim(self):
-        await self.send_message(self.build_iso_request_message(ISO_ADDRESS_CLAIM_PGN, STARTUP_ADDRESS_CLAIM_SOURCE))
-        await asyncio.sleep(1)
-        await self.send_address_claim()
-
-    async def handle_iso_request(self, message, requested_pgn):
-        if requested_pgn == ISO_ADDRESS_CLAIM_PGN:
-            await self.send_message(self.build_iso_address_claim_message())
-            return
-
-        if requested_pgn == PRODUCT_INFORMATION_PGN:
-            now = time.monotonic()
-            last_response = self.n2k_response_times.get(PRODUCT_INFORMATION_PGN, 0)
-            if now - last_response >= 2.0:
-                self.n2k_response_times[PRODUCT_INFORMATION_PGN] = now
-                await self.send_message(self.build_product_information_message())
-            return
-
-        if requested_pgn == CONFIGURATION_INFORMATION_PGN:
-            await self.send_message(self.build_configuration_information_message())
-            return
-
-        if requested_pgn == PGN_LIST_PGN:
-            await self.send_message(self.build_transmit_pgn_list_message(message.source or 255))
-            return
-
-        await self.send_message(
-            self.build_iso_acknowledgement_message(message.source or 255, requested_pgn))
-
-    async def handle_group_function(self, message):
-        try:
-            function_code = message.get_field_by_id('functionCode').value
-            requested_pgn = message.get_field_by_id('pgn').value
-        except Exception:
-            return
-
-        if function_code in ['Request', 'Command']:
-            await self.send_message(
-                self.build_group_function_acknowledgement(message.source or 255, requested_pgn))
-
-    async def handle_iso_address_claim(self, message):
-        if message.source is None:
-            return
-
-        if message.source != self.n2k_address.value or not (self.claim_in_progress or self.cansend):
-            self.register_device(message)
-
-        if message.source != self.n2k_address.value:
-            return
-
-        if not (self.claim_in_progress or self.cansend):
-            return
-
-        their_name = self.get_iso_name_value_from_message(message)
-        our_name = self.get_iso_name_value()
-        if their_name is None or their_name == our_name:
-            return
-
-        if our_name < their_name:
-            await self.send_address_claim()
-            return
-
-        self.found_conflict = True
-        self.increase_address()
-        await self.send_address_claim()
-
-    def build_iso_address_claim_message(self):
-        fields = [
-            nmea2000.NMEA2000Field(id='uniqueNumber', value=self.claim_unique_number()),
-            nmea2000.NMEA2000Field(id='manufacturerCode', value='Diverse Yacht Services'),
-            nmea2000.NMEA2000Field(id='deviceInstanceLower', value=0),
-            nmea2000.NMEA2000Field(id='deviceInstanceUpper', value=0),
-            nmea2000.NMEA2000Field(id='deviceFunction', value='Autopilot', raw_value=150),
-            nmea2000.NMEA2000Field(id='spare', value=0),
-            nmea2000.NMEA2000Field(id='deviceClass', value='Steering and Control surfaces'),
-            nmea2000.NMEA2000Field(id='systemInstance', value=0),
-            nmea2000.NMEA2000Field(id='industryGroup', value='Marine', raw_value=4),
-            nmea2000.NMEA2000Field(id='arbitraryAddressCapable', value='Yes', raw_value=1),
-        ]
-        return nmea2000.NMEA2000Message(
-            PGN=ISO_ADDRESS_CLAIM_PGN,
-            source=self.n2k_address.value,
-            destination=255,
-            priority=6,
-            fields=fields)
-
-    def build_product_information_message(self):
-        unique_number = self.claim_unique_number()
-        fields = [
-            nmea2000.NMEA2000Field(id='nmea2000Version', value=2.0),
-            nmea2000.NMEA2000Field(id='productCode', value=1300),
-            nmea2000.NMEA2000Field(id='modelId', value=self.n2k_name.value or 'pypilot'),
-            nmea2000.NMEA2000Field(id='softwareVersionCode', value=version.strversion),
-            nmea2000.NMEA2000Field(id='modelVersion', value='Autopilot'),
-            nmea2000.NMEA2000Field(id='modelSerialCode', value='%08X' % unique_number),
-            nmea2000.NMEA2000Field(id='certificationLevel', value='Level B'),
-            nmea2000.NMEA2000Field(id='loadEquivalency', value=1),
-        ]
-        return nmea2000.NMEA2000Message(
-            PGN=PRODUCT_INFORMATION_PGN,
-            source=self.n2k_address.value,
-            destination=255,
-            priority=6,
-            fields=fields)
 
     async def init_transport(self):
         print("N2KBridge: Initializing transport...")
@@ -492,11 +291,31 @@ class N2KBridge(object):
 
         include_pgns = self.transport_include_pgns()
 
+        device_options = {
+            "preferred_address": 100,
+            "unique_number": None,
+            "manufacturer_code": 999,
+            "device_function": 150,
+            "device_class": 40,
+            "model_id": "PyPilot",
+            "model_version": "0.1.0",
+            "product_code": None,
+            "manufacturer_information": "PyPilot Autopilot",
+            "installation_description1": "PyPilot Autopilot",
+            "installation_description2": None,
+            "transmit_pgns": self.get_transmit_pgns(),
+            "address_claim_startup_delay": 0.1,
+            "address_claim_detection_time": 0.25,
+            "heartbeat_interval": 60.0,
+            "persistence_path": None,
+            "persistence_key": None,
+        }
+
         transport_classes = {
-            'socketcan': (nmea2000.PythonCanAsyncIOClient, {"interface": "socketcan", "channel": self.n2k_interface.value or "can0", "include_pgns": include_pgns}),
-            'actisense': (nmea2000.ActisenseNmea2000Gateway, {}),
-            'ebyte': (nmea2000.EByteNmea2000Gateway, {}),
-            'usb': (nmea2000.WaveShareNmea2000Gateway, {}),
+            'socketcan': (nmea2000.N2KDevice.for_python_can, {"interface": "socketcan", "channel": self.n2k_interface.value or "can0", "client_options": {"include_pgns": include_pgns}, **device_options}),
+            # 'actisense': (nmea2000.ActisenseNmea2000Gateway, {}),
+            # 'ebyte': (nmea2000.EByteNmea2000Gateway, {}),
+            # 'usb': (nmea2000.WaveShareNmea2000Gateway, {}),
         }
 
         transport_class, transport_kwargs = transport_classes.get(transport, (None, None))
@@ -507,12 +326,8 @@ class N2KBridge(object):
 
         try:
             self.gateway = transport_class(**transport_kwargs)
-            await self.gateway.connect()
-            self.devices = {}
-            self.cansend = False
-            self.claim_in_progress = False
-            self.found_conflict = False
-            await self.startup_address_claim()
+            self.gateway.set_recieve_callback(self.parse_pgn)
+            await self.gateway.start()
         except Exception as e:
             self.set_status('transport error', str(e))
             return
@@ -605,26 +420,6 @@ class N2KBridge(object):
         self.all_pgns = self.all_pgns if hasattr(self, 'all_pgns') else set()
         self.all_pgns.add(message.PGN)
         print(self.all_pgns)
-
-        if message.PGN == ISO_ADDRESS_CLAIM_PGN:
-            asyncio.create_task(self.handle_iso_address_claim(message))
-            return
-
-        if message.PGN == ISO_REQUEST_PGN:
-            try:
-                requested_pgn = message.get_field_by_id('pgn').value
-            except Exception:
-                return
-
-            if message.destination not in [self.n2k_address.value, 255]:
-                return
-
-            asyncio.create_task(self.handle_iso_request(message, requested_pgn))
-            return
-
-        if message.PGN == GROUP_FUNCTION_PGN and message.destination in [self.n2k_address.value, 255]:
-            asyncio.create_task(self.handle_group_function(message))
-            return
 
         if message.PGN == 130306:
             try:
