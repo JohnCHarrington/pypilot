@@ -21,30 +21,6 @@ import nmea2000
 
 log = logging.getLogger('n2k')
 
-ISO_REQUEST_PGN = 59904
-ISO_ADDRESS_CLAIM_PGN = 60928
-ISO_ACKNOWLEDGEMENT_PGN = 59392
-GROUP_FUNCTION_PGN = 126208
-HEARTBEAT_PGN = 126993
-PRODUCT_INFORMATION_PGN = 126996
-CONFIGURATION_INFORMATION_PGN = 126998
-PGN_LIST_PGN = 126464
-
-STARTUP_ADDRESS_CLAIM_SOURCE = 254
-ADDRESS_CLAIM_DETECTION_TIME = 5.0
-HEARTBEAT_INTERVAL = 60.0
-TRANSMIT_PGN_LIST_FUNCTION = 0
-
-BASE_TRANSMIT_PGNS = [
-    ISO_REQUEST_PGN,
-    ISO_ADDRESS_CLAIM_PGN,
-    ISO_ACKNOWLEDGEMENT_PGN,
-    HEARTBEAT_PGN,
-    PRODUCT_INFORMATION_PGN,
-    CONFIGURATION_INFORMATION_PGN,
-    PGN_LIST_PGN,
-]
-
 
 class N2KBridge(object):
     def __init__(self, server):
@@ -72,9 +48,7 @@ class N2KBridge(object):
         self.n2k_host = self.client.register(Property('n2k.host', '', persistent=True))
         self.n2k_port = self.client.register(Property('n2k.port', 0, persistent=True))
         self.n2k_usb_device = self.client.register(Property('n2k.usb_device', '', persistent=True))
-        self.n2k_address = self.client.register(Property('n2k.address', 25, persistent=True))
         self.n2k_name = self.client.register(Property('n2k.name', 'pypilot', persistent=True))
-        self.n2k_unique_number = self.client.register(Property('n2k.unique_number', 0, persistent=True))
         self.n2k_status = self.client.register(StringValue('n2k.status', 'initializing'))
         self.n2k_error = self.client.register(StringValue('n2k.error', ''))
 
@@ -88,7 +62,6 @@ class N2KBridge(object):
             'gps_filtered': self.client.register(Property('n2k.output.gps_filtered', False, persistent=True)),
         }
 
-        old_default_pgn_filters = [129029, 129026, 129033, 130306, 127245, 128259]
         default_pgn_filters = [129029, 129026, 129033, 129283, 129284, 130306, 127245, 128259]
         self.pgn_filters = self.client.register(Property('n2k.pgn_filters',
             default_pgn_filters, persistent=True))
@@ -112,23 +85,8 @@ class N2KBridge(object):
         self.poller = select.poll()
         self.fd_to_source = {}
         self.msgs = {}
-        self.n2k_times = {}
-        self.n2k_response_times = {}
         self.last_imu_time = time.monotonic()
-        self.gps_devices = {}
-        self.nav_devices = {}
-        self.n2k_sid = 0
-        self.devices = {}
         self.cansend = False
-        self.claim_in_progress = False
-        self.found_conflict = False
-        self.address_claim_sent_at = 0.0
-        self.heartbeat_counter = 0
-        self.next_heartbeat_time = 0.0
-
-        if not self.n2k_unique_number.value:
-            unique_number = random.getrandbits(21) & 0x1fffff
-            self.n2k_unique_number.set(unique_number or 1)
 
         self.setup_watches()
         await self.init_transport()
@@ -172,112 +130,7 @@ class N2KBridge(object):
         if not isinstance(pgn_filters, list):
             pgn_filters = []
 
-        include_pgns = list(pgn_filters)
-        for required_pgn in [ISO_REQUEST_PGN, ISO_ADDRESS_CLAIM_PGN, GROUP_FUNCTION_PGN]:
-            if required_pgn not in include_pgns:
-                include_pgns.append(required_pgn)
-        return include_pgns
-
-    def claim_unique_number(self):
-        unique_number = int(self.n2k_unique_number.value or 0) & 0x1fffff
-        if not unique_number:
-            identity = '%s:%s:%s' % (self.n2k_name.value, self.n2k_address.value, time.time_ns())
-            unique_number = int(hashlib.sha1(identity.encode('utf-8')).hexdigest()[:8], 16) & 0x1fffff
-            unique_number = unique_number or 1
-            self.n2k_unique_number.set(unique_number)
-        return unique_number
-
-    def get_iso_name_value(self, address=None):
-        if address is None:
-            address = int(self.n2k_address.value)
-        unique_number = self.claim_unique_number() & 0x1fffff
-        manufacturer_code = 78
-        device_instance_lower = 0
-        device_instance_upper = 0
-        device_function = 150
-        spare = 0
-        device_class = 40
-        system_instance = 0
-        industry_group = 4
-        arbitrary_address_capable = 1
-
-        return (
-            unique_number
-            | (manufacturer_code << 21)
-            | (device_instance_lower << 32)
-            | (device_instance_upper << 35)
-            | (device_function << 40)
-            | (spare << 48)
-            | (device_class << 49)
-            | (system_instance << 56)
-            | (industry_group << 60)
-            | (arbitrary_address_capable << 63)
-        )
-
-    def get_iso_name_value_from_message(self, message):
-        try:
-            unique_number = int(message.get_field_by_id('uniqueNumber').raw_value)
-            manufacturer_code = int(message.get_field_by_id('manufacturerCode').raw_value)
-            device_instance_lower = int(message.get_field_by_id('deviceInstanceLower').raw_value)
-            device_instance_upper = int(message.get_field_by_id('deviceInstanceUpper').raw_value)
-            device_function = int(message.get_field_by_id('deviceFunction').raw_value)
-            spare = int(message.get_field_by_id('spare').raw_value)
-            device_class = int(message.get_field_by_id('deviceClass').raw_value)
-            system_instance = int(message.get_field_by_id('systemInstance').raw_value)
-            industry_group = int(message.get_field_by_id('industryGroup').raw_value)
-            arbitrary_address_capable = int(message.get_field_by_id('arbitraryAddressCapable').raw_value)
-        except Exception:
-            return None
-
-        return (
-            unique_number
-            | (manufacturer_code << 21)
-            | (device_instance_lower << 32)
-            | (device_instance_upper << 35)
-            | (device_function << 40)
-            | (spare << 48)
-            | (device_class << 49)
-            | (system_instance << 56)
-            | (industry_group << 60)
-            | (arbitrary_address_capable << 63)
-        )
-
-    def build_lau_string(self, value):
-        if value is None:
-            value = ''
-        encoded = str(value).encode('utf-8', errors='ignore')
-        return bytes([len(encoded) + 2, 1]) + encoded
-
-    def build_configuration_information_payload(self):
-        transport = self.n2k_transport.value
-        details = self.n2k_interface.value or self.n2k_host.value or self.n2k_usb_device.value or ''
-        install_1 = '%s:%s' % (transport, details) if details else str(transport)
-        install_2 = '%s autopilot' % (self.n2k_name.value or 'pypilot')
-        manufacturer_information = 'pypilot %s' % version.strversion
-        return (
-            self.build_lau_string(install_1)
-            + self.build_lau_string(install_2)
-            + self.build_lau_string(manufacturer_information)
-        )
-
-    def build_configuration_information_message(self):
-        return nmea2000.NMEA2000Message(
-            PGN=CONFIGURATION_INFORMATION_PGN,
-            source=self.n2k_address.value,
-            destination=255,
-            priority=6,
-            raw_can_data=self.build_configuration_information_payload())
-
-    def get_transmit_pgns(self):
-        pgns = list(BASE_TRANSMIT_PGNS)
-        if self.n2k_output_enable['attitude'].value:
-            pgns.append(127257)
-        if self.n2k_output_enable['heading'].value:
-            pgns.append(127250)
-        if self.n2k_output_enable['rate_of_turn'].value:
-            pgns.append(127251)
-        return sorted(set(pgns))
-
+        return pgn_filters
 
     async def init_transport(self):
         print("N2KBridge: Initializing transport...")
@@ -569,18 +422,6 @@ class N2KBridge(object):
         if self.msgs and self.pipe.send(self.msgs):
             self.msgs = {}
 
-    async def update_claim_state(self):
-        if self.claim_in_progress and time.monotonic() - self.address_claim_sent_at >= ADDRESS_CLAIM_DETECTION_TIME:
-            await self.finish_address_claim()
-
-    async def send_heartbeat_if_due(self, now):
-        if not self.cansend or not self.next_heartbeat_time or now < self.next_heartbeat_time:
-            return
-
-        self.heartbeat_counter = (self.heartbeat_counter + 1) % 253
-        await self.send_message(self.build_heartbeat_message())
-        self.next_heartbeat_time = now + HEARTBEAT_INTERVAL
-    
     async def output_pgns(self):
         if not self.cansend:
             return
