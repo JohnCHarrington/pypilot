@@ -51,7 +51,7 @@ class gpio(object):
         if orangepi:
             self.pins = [11, 16, 13, 15, 12]
         else:
-            self.pins = [17, 23, 27, 22, 18, 5, 6, 26]
+            self.pins = [17, 20, 27, 22, 18, 5, 6, 26]
 
         self.lastkeystate = {}
         for p in self.pins:
