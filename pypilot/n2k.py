@@ -3,17 +3,13 @@
 # NMEA2000 bridge for pypilot
 
 import asyncio
-import hashlib
 import multiprocessing
-import random
 import select
-import threading
 import time
 import version
 
 from client import pypilotClient
 from nonblockingpipe import NonBlockingPipe
-from sensors import source_priority
 from values import EnumProperty, Property, StringValue
 import logging
 
@@ -65,8 +61,6 @@ class N2KBridge(object):
         default_pgn_filters = [129029, 129026, 129033, 129283, 129284, 130306, 127245, 128259]
         self.pgn_filters = self.client.register(Property('n2k.pgn_filters',
             default_pgn_filters, persistent=True))
-        if self.pgn_filters.value == old_default_pgn_filters:
-            self.pgn_filters.set(default_pgn_filters)
 
         names = ['gps.source', 'wind.source', 'truewind.source', 'rudder.source',
                  'apb.source', 'water.source', 'gps.filtered.output',
@@ -86,7 +80,8 @@ class N2KBridge(object):
         self.fd_to_source = {}
         self.msgs = {}
         self.last_imu_time = time.monotonic()
-        self.cansend = False
+        self.gps_devices = {}
+        self.nav_devices = {}
 
         self.setup_watches()
         await self.init_transport()
@@ -123,14 +118,34 @@ class N2KBridge(object):
         else:
             pgn_filters = ()
         return (self.n2k_transport.value, self.n2k_interface.value, self.n2k_host.value,
-                int(self.n2k_port.value or 0), self.n2k_usb_device.value, pgn_filters)
+                int(self.n2k_port.value or 0), self.n2k_usb_device.value, pgn_filters,
+                tuple(self.get_transmit_pgns()))
+
+    def get_transmit_pgns(self):
+        pgns = []
+        if self.n2k_output_enable['attitude'].value:
+            pgns.append(127257)
+        if self.n2k_output_enable['heading'].value:
+            pgns.append(127250)
+        if self.n2k_output_enable['rate_of_turn'].value:
+            pgns.append(127251)
+        return pgns
 
     def transport_include_pgns(self):
         pgn_filters = self.pgn_filters.value
         if not isinstance(pgn_filters, list):
             pgn_filters = []
 
-        return pgn_filters
+        return list(pgn_filters)
+
+    async def handle_gateway_status(self, state):
+        state_name = getattr(state, 'name', str(state))
+        if state_name == 'CONNECTED':
+            self.set_status('connected')
+        elif state_name == 'DISCONNECTED':
+            self.set_status('disconnected')
+        elif state_name == 'CLOSED':
+            self.set_status('closed')
 
     async def init_transport(self):
         print("N2KBridge: Initializing transport...")
@@ -146,29 +161,26 @@ class N2KBridge(object):
 
         device_options = {
             "preferred_address": 100,
-            "unique_number": None,
             "manufacturer_code": 999,
             "device_function": 150,
             "device_class": 40,
-            "model_id": "PyPilot",
-            "model_version": "0.1.0",
-            "product_code": None,
+            "model_id": self.n2k_name.value or "PyPilot",
+            "model_version": version.strversion,
             "manufacturer_information": "PyPilot Autopilot",
             "installation_description1": "PyPilot Autopilot",
-            "installation_description2": None,
+            "installation_description2": self.n2k_interface.value or self.n2k_host.value or self.n2k_usb_device.value,
             "transmit_pgns": self.get_transmit_pgns(),
             "address_claim_startup_delay": 0.1,
             "address_claim_detection_time": 0.25,
             "heartbeat_interval": 60.0,
-            "persistence_path": None,
-            "persistence_key": None,
+            "persistence_key": self.n2k_name.value or 'pypilot',
         }
 
         transport_classes = {
             'socketcan': (nmea2000.N2KDevice.for_python_can, {"interface": "socketcan", "channel": self.n2k_interface.value or "can0", "client_options": {"include_pgns": include_pgns}, **device_options}),
-            # 'actisense': (nmea2000.ActisenseNmea2000Gateway, {}),
-            # 'ebyte': (nmea2000.EByteNmea2000Gateway, {}),
-            # 'usb': (nmea2000.WaveShareNmea2000Gateway, {}),
+            'actisense': (nmea2000.N2KDevice.for_actisense, {"host": self.n2k_host.value, "port": int(self.n2k_port.value or 0), "client_options": {"include_pgns": include_pgns}, **device_options}),
+            'ebyte': (nmea2000.N2KDevice.for_ebyte, {"host": self.n2k_host.value, "port": int(self.n2k_port.value or 0), "client_options": {"include_pgns": include_pgns}, **device_options}),
+            'usb': (nmea2000.N2KDevice.for_waveshare, {"port": self.n2k_usb_device.value, "client_options": {"include_pgns": include_pgns}, **device_options}),
         }
 
         transport_class, transport_kwargs = transport_classes.get(transport, (None, None))
@@ -179,13 +191,14 @@ class N2KBridge(object):
 
         try:
             self.gateway = transport_class(**transport_kwargs)
-            self.gateway.set_recieve_callback(self.parse_pgn)
+            self.gateway.set_receive_callback(self.parse_pgn)
+            self.gateway.set_status_callback(self.handle_gateway_status)
             await self.gateway.start()
         except Exception as e:
             self.set_status('transport error', str(e))
             return
 
-        self.set_status('connected')
+        self.set_status('initializing')
 
     async def close_gateway(self):
         if self.gateway:
@@ -268,11 +281,8 @@ class N2KBridge(object):
         self.client.set(name, value)
         self.last_values[name] = value
 
-    def parse_pgn(self, message: nmea2000.NMEA2000Message):
+    async def parse_pgn(self, message: nmea2000.NMEA2000Message):
         device = 'N2K%d' % message.source if message.source is not None else 'N2K'
-        self.all_pgns = self.all_pgns if hasattr(self, 'all_pgns') else set()
-        self.all_pgns.add(message.PGN)
-        print(self.all_pgns)
 
         if message.PGN == 130306:
             try:
@@ -409,7 +419,7 @@ class N2KBridge(object):
 
 
     async def send_message(self, message: nmea2000.NMEA2000Message):
-        if not self.gateway:
+        if not self.gateway or not self.gateway.ready:
             return False
         try:
             await self.gateway.send(message)
@@ -423,13 +433,11 @@ class N2KBridge(object):
             self.msgs = {}
 
     async def output_pgns(self):
-        if not self.cansend:
+        if not self.gateway or not self.gateway.ready:
             return
 
         values = self.last_values
         t = time.monotonic()
-
-        await self.send_heartbeat_if_due(t)
 
         if self.n2k_output_enable['attitude'].value or self.n2k_output_enable['heading'].value or self.n2k_output_enable['rate_of_turn'].value:
             if t - self.last_imu_time > 0.1:
@@ -444,7 +452,7 @@ class N2KBridge(object):
                         nmea2000.NMEA2000Field(id='roll', value=roll_rad),
                         nmea2000.NMEA2000Field(id='reserved_56', value=0),
                     ]
-                    message = nmea2000.NMEA2000Message(PGN=127257, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
+                    message = nmea2000.NMEA2000Message(PGN=127257, source=0, destination=255, priority=3, fields=fields)
                     await self.send_message(message)
 
                 if self.n2k_output_enable['heading'].value and 'imu.heading_lowpass' in values:
@@ -458,7 +466,7 @@ class N2KBridge(object):
                         nmea2000.NMEA2000Field(id='reference', value='Magnetic'),
                         nmea2000.NMEA2000Field(id='reserved_58', value=0),
                     ]
-                    message = nmea2000.NMEA2000Message(PGN=127250, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
+                    message = nmea2000.NMEA2000Message(PGN=127250, source=0, destination=255, priority=3, fields=fields)
                     await self.send_message(message)
 
                 if self.n2k_output_enable['rate_of_turn'].value and 'imu.headingrate_lowpass' in values:
@@ -469,22 +477,13 @@ class N2KBridge(object):
                         nmea2000.NMEA2000Field(id='rate', value=rot_rad_per_s),
                         nmea2000.NMEA2000Field(id='reserved_40', value=0),
                     ]
-                    message = nmea2000.NMEA2000Message(PGN=127251, source=self.n2k_address.value, destination=255, priority=3, fields=fields)
+                    message = nmea2000.NMEA2000Message(PGN=127251, source=0, destination=255, priority=3, fields=fields)
                     await self.send_message(message)
 
                 self.last_imu_time = t
 
     async def poll(self, timeout=100):
-        await self.ensure_transport() 
-
-        await self.update_claim_state()
-
-        if self.gateway:
-            try:
-                data = await asyncio.wait_for(self.gateway.queue.get(), timeout / 1000.0)
-                self.parse_pgn(data)
-            except asyncio.TimeoutError:
-                pass
+        await self.ensure_transport()
 
         self.publish_msgs()
 
@@ -496,6 +495,9 @@ class N2KBridge(object):
                 self.update_gps_fix_watch()
 
         await self.output_pgns()
+
+        if timeout:
+            await asyncio.sleep(timeout / 1000.0)
 
 
     async def n2k_process(self):
