@@ -56,7 +56,7 @@ class py_dep(dep):
             elif self.name == 'flask-socketio':
                 name = 'flask-socketio==5'
             elif self.name == 'nmea2000':
-                name = 'git+https://github.com/johncharrington/nmea2000/python-3.8-compat.git'
+                name = 'git+https://github.com/johncharrington/nmea2000.git@python-3.8-compat'
             else:
                 name = self.name
             ret = os.system('sudo python3 -m pip install ' + name)
