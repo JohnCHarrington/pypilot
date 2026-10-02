@@ -295,8 +295,10 @@ def test_engage_in_new_mode_waits_for_heading_in_that_mode():
     assert client.sets == [('ap.mode', 'gps')]
     control.on_value('ap.heading', 100.0)  # old mode, ignored
     control.on_value('ap.mode', 'gps')
-    control.on_value('ap.heading', 101.0)  # may predate the change
+    clock.t += .3
+    control.on_value('ap.heading', 101.0)  # may still be in the old mode
     assert 'ap.enabled' not in sets(client)
+    clock.t += .3
     control.on_value('ap.heading', 102.0)
     assert sets(client)['ap.heading_command'] == 102.0
     assert sets(client)['ap.enabled'] is True
@@ -309,7 +311,7 @@ def test_mode_change_while_engaged_with_heading_waits_for_mode():
     assert ack_codes(control) == (nc.PGN_ACK, [0, 0, 0])
     assert client.sets == [('ap.mode', 'compass')]  # pypilot would overwrite a command set now
     control.on_value('ap.mode', 'compass')
-    control.on_value('ap.heading', 101.0)
+    clock.t += nc.ENGAGE_SETTLE
     control.on_value('ap.heading', 102.0)
     assert sets(client)['ap.heading_command'] == pytest.approx(45, abs=.01)
 
@@ -325,6 +327,25 @@ def test_engage_same_mode_uses_current_heading():
     control, client, clock = make_control()
     control.handle_message(switch_message(ch2=nc.SWITCH_ON))
     assert client.sets == [('ap.heading_command', 100.0), ('ap.enabled', True)]
+
+
+def test_engage_timeout_names_mode_and_updates_active_alert():
+    control, client, clock = make_control(**{'ap.modes': ['compass', 'gps', 'nav']})
+    control.handle_message(switch_message(ch3=nc.SWITCH_ON))   # gps, never confirmed by pypilot
+    clock.t += nc.ENGAGE_TIMEOUT + .1
+    control.poll()
+    assert control.alerts[nc.ALERT_REJECTED].text == 'Autopilot rejected: engage in gps mode timed out'
+    clock.t += .1
+    control.handle_message(switch_message(ch4=nc.SWITCH_ON))   # nav, also never confirmed
+    control.values['ap.modes'] = ['compass']
+    control.handle_message(switch_message(ch4=nc.SWITCH_OFF))
+    control.handle_message(switch_message(ch2=nc.SWITCH_ON))   # compass engages at once
+    control.values['ap.modes'] = ['compass', 'gps']
+    control.values['ap.enabled'] = False
+    control.handle_message(switch_message(ch4=nc.SWITCH_ON))   # nav not available
+    clock.t += .1
+    texts = [decode(126985, encode(m)) for m in control.poll() if m.PGN == 126985]
+    assert [field(t, 'alertTextDescription').value for t in texts] == ['Autopilot rejected: nav mode not available']
 
 
 def test_rejected_press_raises_caution_alert():
@@ -603,3 +624,13 @@ def test_no_alerts_without_output():
     control, client, clock = make_control(**{'imu.error': 'No IMU'})
     control.settings['output'].value = False
     assert sent(control, 126983) == []
+
+
+def test_text_list_uses_client_value_list():
+    # pypilotClient keeps the 'values' list in client.values.value, not in receive()
+    control, client, clock = make_control()
+    client.values = Setting({'ap.pilot.basic.P': {'type': 'RangeProperty', 'min': 0, 'max': 1}})
+    text(control, 'PP:LIST ap.pilot.basic')
+    assert description2(control) == 'ap.pilot.basic: .P'
+    text(control, 'PP:INFO ap.pilot.basic.P')
+    assert description2(control) == 'RangeProperty 0..1'

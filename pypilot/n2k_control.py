@@ -48,6 +48,7 @@ MOMENTARY_CHANNELS = list(CH_ADJUST) + list(CH_JOG) + [CH_NEXT_PROFILE]
 MOMENTARY_TIME = .5   # momentary channels show ON this long after acting
 SWITCH_REARM_TIME = 1 # a channel left ON re-arms after this long
 ENGAGE_TIMEOUT = 3
+ENGAGE_SETTLE = .5    # pypilot reports the new mode before its heading is in that mode
 REJECT_ALERT_TIME = 5
 SILENCE_TIME = 30
 STATUS_PERIOD = 1
@@ -209,6 +210,8 @@ def build_ack(destination, pgn, pgn_error, param_errors):
                                  'pgnErrorCode': Lookup(pgn_error),
                                  'transmissionIntervalPriorityErrorCode': Lookup(0),
                                  'numberOfParameters': len(params),
+                                 # repeating fields: '##list##' in current nmea2000, 'list' in older releases
+                                 '##list##': params,
                                  'list': params},
                         id='nmeaAcknowledgeGroupFunction', destination=destination, priority=3)
 
@@ -349,7 +352,10 @@ class N2KControl(object):
 
     def reject(self, reason):
         self.reject_until = self.now() + REJECT_ALERT_TIME
-        self.alerts[ALERT_REJECTED].text = truncate('Autopilot rejected: ' + reason)
+        alert = self.alerts[ALERT_REJECTED]
+        alert.text = truncate('Autopilot rejected: ' + reason)
+        if alert.active:  # already showing an earlier rejection: send the new text now
+            alert.last_time = alert.last_text_time = 0
         return False
 
     def standby(self):
@@ -375,8 +381,7 @@ class N2KControl(object):
             # ap.heading is still in the old mode's frame, and pypilot resets
             # the command when it sees the new mode, so wait for that before
             # setting the command
-            self.pending_engage = {'mode': mode, 'command': command,
-                                   'time': self.now(), 'headings': 0}
+            self.pending_engage = {'mode': mode, 'command': command, 'time': self.now()}
             return True
 
         if command is None and not self.enabled():
@@ -539,11 +544,17 @@ class N2KControl(object):
         self.description2 = truncate(text)
         self.send_126998()
 
+    def value_list(self):
+        '''info for every pypilot value, by name. pypilotClient keeps the 'values'
+        list to itself (client.values) rather than returning it from receive()'''
+        info = getattr(getattr(self.client, 'values', None), 'value', None)
+        if not isinstance(info, dict):
+            info = self.values.get('values')
+        return info if isinstance(info, dict) else None
+
     def value_info(self, name):
-        info = self.values.get('values')
-        if isinstance(info, dict):
-            return info.get(name)
-        return None
+        info = self.value_list()
+        return info.get(name) if info else None
 
     def text_command(self, command, message):
         word = command.split(' ', 1)[0].upper()
@@ -569,8 +580,8 @@ class N2KControl(object):
             args = command.split()[1:]
             prefix = args[0] if args else ''
             page = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
-            info = self.values.get('values')
-            if not isinstance(info, dict):
+            info = self.value_list()
+            if not info:
                 return self.text_result('ERR value list not loaded')
             # the prefix is shown once, followed by the rest of each name
             names = sorted(n[len(prefix):] for n in info if n.startswith(prefix))
@@ -978,15 +989,15 @@ class N2KControl(object):
         pending = self.pending_engage
         if pending:
             if name == 'ap.mode' and value == pending['mode']:
-                pending['mode_seen'] = True
-            elif name == 'ap.heading' and pending.get('mode_seen'):
-                # skip the first heading, it may predate the mode change
-                pending['headings'] += 1
-                if pending['headings'] >= 2:
-                    self.pending_engage = None
-                    command = pending['command']
-                    self.set('ap.heading_command', value if command is None else command)
-                    self.set('ap.enabled', True)
+                pending.setdefault('mode_time', self.now())
+            elif name == 'ap.heading' and 'mode_time' in pending and \
+                    self.now() - pending['mode_time'] >= ENGAGE_SETTLE:
+                # the server echoes the mode before the autopilot has computed a heading
+                # in it, so only take headings from a while after the change
+                self.pending_engage = None
+                command = pending['command']
+                self.set('ap.heading_command', value if command is None else command)
+                self.set('ap.enabled', True)
         text = self.pending_text
         if text and name == text['name']:
             text['value'], text['have'] = value, True
@@ -1052,8 +1063,9 @@ class N2KControl(object):
         if self.jog_end and now >= self.jog_end:
             self.stop_jog()
         if self.pending_engage and now - self.pending_engage['time'] > ENGAGE_TIMEOUT:
+            mode = self.pending_engage['mode']
             self.pending_engage = None
-            self.reject('engage timed out')
+            self.reject('engage in %s mode timed out' % mode)
         for channel, t in list(self.switches_on.items()):
             if now - t > SWITCH_REARM_TIME:
                 del self.switches_on[channel]

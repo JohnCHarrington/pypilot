@@ -3,6 +3,8 @@
 # NMEA2000 bridge for pypilot
 
 import asyncio
+import calendar
+import datetime
 import multiprocessing
 import select
 import time
@@ -17,6 +19,19 @@ import nmea2000
 import n2k_control
 
 log = logging.getLogger('n2k')
+
+
+def gps_timestamp(message):
+    '''epoch seconds from a message's date and time fields, as the other gps inputs report'''
+    try:
+        date = message.get_field_by_id('date').value
+        time_of_day = message.get_field_by_id('time').value
+    except Exception:
+        return None
+    if not isinstance(date, datetime.date) or not isinstance(time_of_day, datetime.time):
+        return None
+    return calendar.timegm(datetime.datetime.combine(date, time_of_day).timetuple()) + \
+        time_of_day.microsecond / 1e6
 
 
 class N2KBridge(object):
@@ -384,10 +399,7 @@ class N2KBridge(object):
                 cog_rad = message.get_field_by_id('cog').value
             except Exception:
                 cog_rad = None
-            try:
-                timestamp = message.get_field_by_id('time').value
-            except Exception:
-                timestamp = None
+            timestamp = gps_timestamp(message)
             if sog_ms is not None:
                 updates['speed'] = sog_ms * 1.94384
             if cog_rad is not None:
@@ -416,10 +428,7 @@ class N2KBridge(object):
             return
 
         if message.PGN == 129033:
-            try:
-                timestamp = message.get_field_by_id('time').value
-            except Exception:
-                timestamp = None
+            timestamp = gps_timestamp(message)
             if timestamp is not None:
                 self.update_gps_message(device, {'timestamp': timestamp})
             return

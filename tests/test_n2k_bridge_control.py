@@ -123,3 +123,12 @@ def test_missing_library_hooks_are_reported(capsys):
         set_iso_request_handler = None
     make_bridge(OldGateway())
     assert 'nmea2000 library has no' in capsys.readouterr().out
+
+
+def test_gps_timestamp_is_epoch_seconds():
+    import datetime
+    message = nmea2000.NMEA2000Message(PGN=129033, fields=[
+        nmea2000.NMEA2000Field(id='date', value=datetime.date(2026, 10, 2)),
+        nmea2000.NMEA2000Field(id='time', value=datetime.time(16, 26, 3, 500000))])
+    assert n2k.gps_timestamp(message) == 1790958363.5
+    assert n2k.gps_timestamp(nmea2000.NMEA2000Message(PGN=129033, fields=[])) is None
