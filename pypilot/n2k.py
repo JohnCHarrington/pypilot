@@ -10,10 +10,11 @@ import version
 
 from client import pypilotClient
 from nonblockingpipe import NonBlockingPipe
-from values import EnumProperty, Property, StringValue
+from values import EnumProperty, Property, RangeProperty, StringValue
 import logging
 
 import nmea2000
+import n2k_control
 
 log = logging.getLogger('n2k')
 
@@ -62,6 +63,17 @@ class N2KBridge(object):
         self.pgn_filters = self.client.register(Property('n2k.pgn_filters',
             default_pgn_filters, persistent=True))
 
+        # control of pypilot over n2k, see docs/n2k-control.md
+        control_settings = {
+            'control': self.client.register(EnumProperty('n2k.control', 'monitor',
+                                                         n2k_control.CONTROL_LEVELS, persistent=True)),
+            'bank': self.client.register(Property('n2k.switch.bank', 'off', persistent=True)),
+            'allowed': self.client.register(Property('n2k.control.allowed', [], persistent=True)),
+            'jog_pulse': self.client.register(RangeProperty('n2k.control.jog_pulse', .3, .1, 1, persistent=True)),
+            'description': self.client.register(Property('n2k.installation_description', '', persistent=True)),
+            'output': self.n2k_output_enable['autopilot'],
+        }
+
         names = ['gps.source', 'wind.source', 'truewind.source', 'rudder.source',
                  'apb.source', 'water.source', 'gps.filtered.output',
                  'ap.mode', 'ap.enabled', 'ap.heading_command']
@@ -82,6 +94,7 @@ class N2KBridge(object):
         self.last_imu_time = time.monotonic()
         self.gps_devices = {}
         self.nav_devices = {}
+        self.control = n2k_control.N2KControl(self.client, self.last_values, control_settings)
 
         self.setup_watches()
         await self.init_transport()
@@ -97,6 +110,9 @@ class N2KBridge(object):
             self.client.watch(name)
 
         for name in ['wind.rate', 'truewind.rate', 'rudder.rate']:
+            self.client.watch(name)
+
+        for name in n2k_control.WATCHES:
             self.client.watch(name)
 
         self.update_gps_fix_watch()
@@ -119,7 +135,7 @@ class N2KBridge(object):
             pgn_filters = ()
         return (self.n2k_transport.value, self.n2k_interface.value, self.n2k_host.value,
                 int(self.n2k_port.value or 0), self.n2k_usb_device.value, pgn_filters,
-                tuple(self.get_transmit_pgns()))
+                tuple(self.get_transmit_pgns()), tuple(self.control.include_pgns()))
 
     def get_transmit_pgns(self):
         pgns = []
@@ -129,14 +145,20 @@ class N2KBridge(object):
             pgns.append(127250)
         if self.n2k_output_enable['rate_of_turn'].value:
             pgns.append(127251)
-        return pgns
+        if self.n2k_output_enable['rudder'].value:
+            pgns.append(127245)
+        return pgns + self.control.transmit_pgns()
 
     def transport_include_pgns(self):
         pgn_filters = self.pgn_filters.value
         if not isinstance(pgn_filters, list):
             pgn_filters = []
 
-        return list(pgn_filters)
+        include_pgns = list(pgn_filters)
+        for pgn in self.control.include_pgns():
+            if pgn not in include_pgns:
+                include_pgns.append(pgn)
+        return include_pgns
 
     async def handle_gateway_status(self, state):
         state_name = getattr(state, 'name', str(state))
@@ -167,8 +189,8 @@ class N2KBridge(object):
             "model_id": self.n2k_name.value or "PyPilot",
             "model_version": version.strversion,
             "manufacturer_information": "PyPilot Autopilot",
-            "installation_description1": "PyPilot Autopilot",
-            "installation_description2": self.n2k_interface.value or self.n2k_host.value or self.n2k_usb_device.value,
+            "installation_description1": self.control.settings['description'].value or '',
+            "installation_description2": self.control.description2,
             "transmit_pgns": self.get_transmit_pgns(),
             "address_claim_startup_delay": 0.1,
             "address_claim_detection_time": 0.25,
@@ -193,12 +215,45 @@ class N2KBridge(object):
             self.gateway = transport_class(**transport_kwargs)
             self.gateway.set_receive_callback(self.parse_pgn)
             self.gateway.set_status_callback(self.handle_gateway_status)
+            self.attach_control()
             await self.gateway.start()
         except Exception as e:
             self.set_status('transport error', str(e))
             return
 
         self.set_status('initializing')
+
+    def attach_control(self):
+        self.control.attach(self.gateway)
+        # these hooks are needed for 127237 commands and PP: text commands;
+        # without them the library NAKs 126208 commands and requests itself
+        missing = []
+        for setter, handler in [('set_group_function_handler', self.handle_group_function),
+                                ('set_iso_request_handler', self.handle_iso_request)]:
+            register = getattr(self.gateway, setter, None)
+            if register:
+                register(handler)
+            else:
+                missing.append(setter)
+        if missing:
+            print('N2KBridge: nmea2000 library has no %s; 127237 commands and PP: text commands are unavailable'
+                  % ', '.join(missing))
+
+    async def handle_group_function(self, message, payload):
+        handled = self.control.handle_group_function(message, payload)
+        await self.send_control_messages(self.control.outbox)
+        self.control.outbox = []
+        return handled
+
+    async def handle_iso_request(self, message, pgn):
+        handled = self.control.handle_iso_request(message, pgn)
+        await self.send_control_messages(self.control.outbox)
+        self.control.outbox = []
+        return handled
+
+    async def send_control_messages(self, messages):
+        for message in messages:
+            await self.send_message(message)
 
     async def close_gateway(self):
         if self.gateway:
@@ -282,6 +337,8 @@ class N2KBridge(object):
         self.last_values[name] = value
 
     async def parse_pgn(self, message: nmea2000.NMEA2000Message):
+        if self.control.handle_message(message):
+            return
         device = 'N2K%d' % message.source if message.source is not None else 'N2K'
 
         if message.PGN == 130306:
@@ -433,13 +490,16 @@ class N2KBridge(object):
             self.msgs = {}
 
     async def output_pgns(self):
+        # control timers (jog pulses, pending engage) run even without a bus
+        control_messages = self.control.poll()
         if not self.gateway or not self.gateway.ready:
             return
 
         values = self.last_values
         t = time.monotonic()
 
-        if self.n2k_output_enable['attitude'].value or self.n2k_output_enable['heading'].value or self.n2k_output_enable['rate_of_turn'].value:
+        if self.n2k_output_enable['attitude'].value or self.n2k_output_enable['heading'].value or \
+           self.n2k_output_enable['rate_of_turn'].value or self.n2k_output_enable['rudder'].value:
             if t - self.last_imu_time > 0.1:
                 if self.n2k_output_enable['attitude'].value and 'imu.pitch' in values and 'imu.roll' in values:
                     pitch_rad = values['imu.pitch'] * 3.141592653589793 / 180.0
@@ -480,7 +540,14 @@ class N2KBridge(object):
                     message = nmea2000.NMEA2000Message(PGN=127251, source=0, destination=255, priority=3, fields=fields)
                     await self.send_message(message)
 
+                if self.n2k_output_enable['rudder'].value:
+                    message = self.control.rudder()
+                    if message:
+                        await self.send_message(message)
+
                 self.last_imu_time = t
+
+        await self.send_control_messages(control_messages)
 
     async def poll(self, timeout=100):
         await self.ensure_transport()
@@ -491,6 +558,7 @@ class N2KBridge(object):
         for name in pypilot_msgs:
             value = pypilot_msgs[name]
             self.last_values[name] = value
+            self.control.on_value(name, value)
             if name == 'gps.filtered.output' or name == 'n2k.output.gps_filtered':
                 self.update_gps_fix_watch()
 

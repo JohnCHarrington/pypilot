@@ -1,0 +1,605 @@
+"""
+Tests for N2K control of pypilot (pypilot/n2k_control.py, docs/n2k-control.md).
+
+Messages are round-tripped through the nmea2000 library's generated
+encoders/decoders so the field layouts are checked against the real codec.
+"""
+import math
+
+import pytest
+
+nmea2000 = pytest.importorskip('nmea2000')
+from nmea2000 import pgns
+
+import n2k_control as nc
+
+
+class Setting:
+    def __init__(self, value):
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeClient:
+    def __init__(self):
+        self.sets = []
+        self.sent = []
+        self.watches = {}
+
+    def set(self, name, value):
+        self.sets.append((name, value))
+
+    def send(self, msg):
+        self.sent.append(msg)
+
+    def watch(self, name, value=True):
+        self.watches[name] = value
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+OWN_NAME = 0x1234567890abcdef
+OTHER_NAME = 0x1111
+
+
+class Gateway:
+    own_name = OWN_NAME
+    manufacturer_information = 'PyPilot Autopilot'
+
+
+def make_control(level='steer', bank=1, mode='compass', enabled=False, **values):
+    clock = Clock()
+    client = FakeClient()
+    v = {'ap.enabled': enabled, 'ap.mode': mode, 'ap.preferred_mode': mode,
+         'ap.modes': ['compass', 'gps', 'wind'], 'ap.heading': 100.0,
+         'ap.heading_command': 90.0, 'ap.heading_error': 0, 'ap.tack.state': 'none',
+         'ap.tack.direction': 'port', 'servo.flags': '', 'servo.controller': 'arduino',
+         'servo.command': 0, 'imu.heading_lowpass': 100.0, 'imu.error': '',
+         'imu.warning': '', 'rudder.source': 'none', 'rudder.angle': False,
+         'profile': 'default', 'profiles': ['default', 'heavy']}
+    v.update(values)
+    settings = {'control': Setting(level), 'bank': Setting(bank), 'allowed': Setting([]),
+                'jog_pulse': Setting(.3), 'description': Setting('saloon'),
+                'output': Setting(True)}
+    control = nc.N2KControl(client, v, settings, now=clock)
+    control.attach(Gateway())
+    return control, client, clock
+
+
+def encode(message):
+    fn = getattr(pgns, 'encode_pgn_%d' % message.PGN, None) or \
+        getattr(pgns, 'encode_pgn_%d_%s' % (message.PGN, message.id))
+    return fn(message)
+
+
+def decode(pgn, data):
+    return getattr(pgns, 'decode_pgn_%d' % pgn)(int.from_bytes(data, 'little'), len(data) * 8)
+
+
+def field(message, id):
+    return message.get_field_by_id(id)
+
+
+def sent(control, pgn):
+    return [m for m in control.poll() if m.PGN == pgn]
+
+
+class Source:
+    def __init__(self, source=7, name=OTHER_NAME):
+        self.source = source
+        self.source_iso_name = type('IsoName', (), {'name': name})()
+
+
+def command_payload(pgn, params):
+    '''126208 Command group function with (field index, value bytes) params'''
+    payload = bytes([1]) + pgn.to_bytes(3, 'little') + bytes([0xf8, len(params)])
+    for index, value in params:
+        payload += bytes([index]) + value
+    return payload
+
+
+def u16(radians):
+    return round(radians / .0001).to_bytes(2, 'little')
+
+
+def lau(text):
+    return bytes([len(text) + 2, 1]) + text.encode()
+
+
+def ack_codes(control):
+    acks = [m for m in control.outbox if m.PGN == 126208]
+    assert len(acks) == 1
+    data = encode(acks[0])
+    control.outbox = [m for m in control.outbox if m.PGN != 126208]
+    params = [data[6 + i // 2] >> (4 * (i % 2)) & 0xf for i in range(data[5])]
+    return data[4] & 0xf, params
+
+
+def sets(client):
+    return dict(client.sets)
+
+
+# ---- 126208 parsing ---------------------------------------------------------
+
+def test_parse_command_multiple_parameters():
+    payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.pi / 2))])
+    pgn, params = nc.parse_command(payload)
+    assert pgn == 127237
+    assert params[0] == (5, 4)
+    assert params[1] == (7, 1)
+    assert params[2][0] == 11 and params[2][1] == pytest.approx(math.pi / 2, abs=1e-4)
+
+
+def test_parse_command_signed_and_not_available():
+    payload = command_payload(127237, [(10, (-1000).to_bytes(2, 'little', signed=True)),
+                                       (11, b'\xff\xff')])
+    pgn, params = nc.parse_command(payload)
+    assert params[0][1] == pytest.approx(-.1)
+    assert params[1] == (11, None)
+
+
+def test_parse_command_string():
+    pgn, params = nc.parse_command(command_payload(126998, [(1, lau('PP:ap.mode'))]))
+    assert (pgn, params) == (126998, [(1, 'PP:ap.mode')])
+
+
+def test_parse_command_truncated():
+    with pytest.raises(ValueError):
+        nc.parse_command(command_payload(127237, [(11, b'\x01')]))
+
+
+# ---- path A: 127237 commands -------------------------------------------------
+
+def test_engage_with_heading_to_steer():
+    control, client, clock = make_control()
+    payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.radians(45)))])
+    assert control.handle_group_function(Source(), payload)
+    assert ack_codes(control) == (nc.PGN_ACK, [0, 0, 0])
+    s = sets(client)
+    assert s['ap.enabled'] is True
+    assert s['ap.heading_command'] == pytest.approx(45, abs=.01)
+
+
+def test_standby_allowed_at_monitor_but_engage_denied():
+    control, client, clock = make_control(level='monitor', enabled=True)
+    assert control.handle_group_function(Source(), command_payload(127237, [(5, bytes([4]))]))
+    assert ack_codes(control) == (nc.PGN_ACCESS_DENIED, [nc.PARAM_ACCESS_DENIED])
+    assert client.sets == []
+
+    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [0])
+    assert sets(client)['ap.enabled'] is False
+
+
+def test_control_off_leaves_commands_to_library():
+    control, client, clock = make_control(level='off')
+    assert not control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    assert client.sets == []
+
+
+def test_heading_to_steer_refused_in_wind_mode():
+    control, client, clock = make_control(mode='wind', enabled=True)
+    control.handle_group_function(Source(), command_payload(127237, [(11, u16(1))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_TEMPORARY_ERROR])
+    assert client.sets == []
+
+
+def test_unsupported_field_rejects_whole_command():
+    control, client, clock = make_control()
+    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([4])), (13, u16(.5))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [0, nc.PARAM_NOT_SUPPORTED])
+    assert client.sets == []
+
+
+def test_true_heading_reference_not_supported():
+    control, client, clock = make_control()
+    payload = command_payload(127237, [(5, bytes([4])), (7, bytes([0])), (11, u16(1))])
+    control.handle_group_function(Source(), payload)
+    assert ack_codes(control) == (nc.PGN_ACK, [0, nc.PARAM_NOT_SUPPORTED, 0])
+    assert client.sets == []
+
+
+def test_unavailable_mode_refused():
+    control, client, clock = make_control()
+    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([5]))]))  # track -> nav
+    assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_TEMPORARY_ERROR])
+
+
+def test_non_follow_up_jogs_starboard():
+    control, client, clock = make_control()
+    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([1])), (9, bytes([1]))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [0, 0])
+    assert client.sets[-1] == ('servo.command', -1)
+    clock.t += .5
+    control.poll()
+    assert client.sets[-1] == ('servo.command', 0)
+
+
+def test_allowed_list_restricts_steering_but_not_standby():
+    control, client, clock = make_control(enabled=True)
+    control.settings['allowed'].value = ['0x2222']
+    control.handle_group_function(Source(), command_payload(127237, [(11, u16(1))]))
+    assert ack_codes(control)[0] == nc.PGN_ACCESS_DENIED
+    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [0])
+    control.handle_group_function(Source(name=0x2222), command_payload(127237, [(5, bytes([4]))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [0])
+
+
+# ---- path B: switch bank -----------------------------------------------------
+
+def switch_message(instance=1, **channels):
+    fields = {'instance': instance}
+    for ch in range(1, 29):
+        fields['switch%d' % ch] = nc.Lookup(channels.get('ch%d' % ch, nc.SWITCH_NA))
+    data = encode(nc.make_message(127502, fields))
+    message = decode(127502, data)
+    message.source_iso_name = None
+    return message
+
+
+def test_switch_edge_triggered():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch8=nc.SWITCH_ON))
+    control.handle_message(switch_message(ch8=nc.SWITCH_ON))  # repeated ON: no action
+    assert [s for s in client.sets if s[0] == 'ap.heading_command'] == [('ap.heading_command', 91.0)]
+    control.handle_message(switch_message(ch8=nc.SWITCH_OFF))
+    control.handle_message(switch_message(ch8=nc.SWITCH_ON))
+    assert sets(client)['ap.heading_command'] == 92.0
+
+
+def test_switch_rearms_after_timeout():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch10=nc.SWITCH_ON))
+    clock.t += 1.5
+    control.poll()
+    control.handle_message(switch_message(ch10=nc.SWITCH_ON))
+    assert sets(client)['ap.heading_command'] == 110.0
+
+
+def test_wind_mode_adjust_is_inverted():
+    control, client, clock = make_control(mode='wind', enabled=True, **{'ap.heading_command': 40.0})
+    control.handle_message(switch_message(ch8=nc.SWITCH_ON))  # +1 starboard
+    assert sets(client)['ap.heading_command'] == 39.0
+
+
+def test_other_bank_ignored():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(instance=2, ch1=nc.SWITCH_ON))
+    assert client.sets == []
+
+
+def test_mode_channel_off_does_not_disengage():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch2=nc.SWITCH_OFF))
+    assert client.sets == []
+
+
+def test_standby_switch():
+    control, client, clock = make_control(level='monitor', enabled=True)
+    control.handle_message(switch_message(ch1=nc.SWITCH_ON))
+    assert sets(client)['ap.enabled'] is False
+
+
+def test_engage_in_new_mode_waits_for_heading_in_that_mode():
+    control, client, clock = make_control()
+    control.handle_message(switch_message(ch3=nc.SWITCH_ON))  # gps
+    assert client.sets == [('ap.mode', 'gps')]
+    control.on_value('ap.heading', 100.0)  # old mode, ignored
+    control.on_value('ap.mode', 'gps')
+    control.on_value('ap.heading', 101.0)  # may predate the change
+    assert 'ap.enabled' not in sets(client)
+    control.on_value('ap.heading', 102.0)
+    assert sets(client)['ap.heading_command'] == 102.0
+    assert sets(client)['ap.enabled'] is True
+
+
+def test_mode_change_while_engaged_with_heading_waits_for_mode():
+    control, client, clock = make_control(mode='gps', enabled=True)
+    payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.radians(45)))])
+    control.handle_group_function(Source(), payload)
+    assert ack_codes(control) == (nc.PGN_ACK, [0, 0, 0])
+    assert client.sets == [('ap.mode', 'compass')]  # pypilot would overwrite a command set now
+    control.on_value('ap.mode', 'compass')
+    control.on_value('ap.heading', 101.0)
+    control.on_value('ap.heading', 102.0)
+    assert sets(client)['ap.heading_command'] == pytest.approx(45, abs=.01)
+
+
+def test_mode_change_while_engaged_keeps_course():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch3=nc.SWITCH_ON))
+    assert client.sets == [('ap.mode', 'gps')]
+    assert control.pending_engage is None
+
+
+def test_engage_same_mode_uses_current_heading():
+    control, client, clock = make_control()
+    control.handle_message(switch_message(ch2=nc.SWITCH_ON))
+    assert client.sets == [('ap.heading_command', 100.0), ('ap.enabled', True)]
+
+
+def test_rejected_press_raises_caution_alert():
+    control, client, clock = make_control()
+    control.handle_message(switch_message(ch4=nc.SWITCH_ON))  # nav not available
+    assert client.sets == []
+    alerts = sent(control, 126983)
+    assert [field(decode(126983, encode(m)), 'alertId').value for m in alerts] == [nc.ALERT_REJECTED]
+    clock.t += nc.REJECT_ALERT_TIME + 1
+    cleared = sent(control, 126983)
+    assert field(decode(126983, encode(cleared[0])), 'alertState').raw_value == nc.STATE_NORMAL
+
+
+def test_tack_and_cancel():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch13=nc.SWITCH_ON))
+    assert client.sets == [('ap.tack.direction', 'starboard'), ('ap.tack.state', 'begin')]
+    control.values['ap.tack.state'] = 'waiting'
+    control.handle_message(switch_message(ch13=nc.SWITCH_OFF))
+    control.handle_message(switch_message(ch11=nc.SWITCH_ON))
+    assert client.sets[-1] == ('ap.tack.state', 'none')
+
+
+def test_next_profile_wraps():
+    control, client, clock = make_control(**{'profile': 'heavy'})
+    control.handle_message(switch_message(ch17=nc.SWITCH_ON))
+    assert sets(client)['profile'] == 'default'
+
+
+def test_jog_refused_while_engaged():
+    control, client, clock = make_control(enabled=True)
+    control.handle_message(switch_message(ch15=nc.SWITCH_ON))
+    assert 'servo.command' not in sets(client)
+
+
+def test_indicators():
+    control, client, clock = make_control(mode='wind', enabled=True, **{'servo.flags': 'SYNC OVERTEMP_FAULT'})
+    control.handle_message(switch_message(ch8=nc.SWITCH_ON))
+    status = [m for m in control.outbox if m.PGN == 127501][-1]
+    decoded = decode(127501, encode(status))
+    state = [field(decoded, 'indicator%d' % ch).raw_value for ch in range(1, 29)]
+    assert field(decoded, 'instance').value == 1
+    assert state[nc.CH_STANDBY - 1] == nc.SWITCH_OFF
+    assert state[5 - 1] == nc.SWITCH_ON   # wind
+    assert state[2 - 1] == nc.SWITCH_OFF  # compass
+    assert state[8 - 1] == nc.SWITCH_ON   # momentary echo of +1
+    assert state[nc.CH_SERVO_FAULT - 1] == nc.SWITCH_ON
+    assert state[19 - 1] == nc.SWITCH_NA
+    clock.t += 1
+    status = sent(control, 127501)[-1]
+    assert field(decode(127501, encode(status)), 'indicator8').raw_value == nc.SWITCH_OFF
+
+
+# ---- 127237 / 127245 status ------------------------------------------------
+
+def test_heading_track_control_status_compass():
+    control, client, clock = make_control(enabled=True)
+    decoded = decode(127237, encode(control.heading_track_control()))
+    assert field(decoded, 'steeringMode').raw_value == nc.STEERING_HEADING
+    assert field(decoded, 'headingReference').raw_value == nc.REFERENCE_MAGNETIC
+    assert field(decoded, 'headingToSteerCourse').value == pytest.approx(math.radians(90), abs=1e-3)
+    assert field(decoded, 'vesselHeading').value == pytest.approx(math.radians(100), abs=1e-3)
+
+
+def test_heading_track_control_status_wind_reports_compass_equivalent():
+    control, client, clock = make_control(mode='wind', enabled=True,
+                                          **{'ap.heading_error': 10, 'imu.heading_lowpass': 200.0})
+    decoded = decode(127237, encode(control.heading_track_control()))
+    assert field(decoded, 'headingToSteerCourse').value == pytest.approx(math.radians(190), abs=1e-3)
+
+
+def test_heading_track_control_standby():
+    control, client, clock = make_control(**{'servo.command': -.5})
+    decoded = decode(127237, encode(control.heading_track_control()))
+    assert field(decoded, 'steeringMode').raw_value == nc.STEERING_MAIN
+    assert field(decoded, 'override').raw_value == nc.YES
+    assert field(decoded, 'commandedRudderDirection').raw_value == nc.RUDDER_STARBOARD
+    assert field(decoded, 'headingToSteerCourse').value is None
+
+
+def test_127237_sent_periodically_and_on_change():
+    control, client, clock = make_control()
+    assert len(sent(control, 127237)) == 1
+    clock.t += .1
+    assert sent(control, 127237) == []
+    control.values['ap.enabled'] = True
+    clock.t += .2
+    assert len(sent(control, 127237)) == 1
+
+
+def test_rudder_only_for_local_sensor():
+    control, client, clock = make_control(**{'rudder.source': 'serial', 'rudder.angle': 10.0})
+    decoded = decode(127245, encode(control.rudder()))
+    assert field(decoded, 'position').value == pytest.approx(math.radians(-10), abs=1e-3)
+    control.values['rudder.source'] = 'N2K12'
+    assert control.rudder() is None
+
+
+# ---- path C: PP: text commands ----------------------------------------------
+
+def text(control, command, source=None):
+    control.handle_group_function(source or Source(), command_payload(126998, [(1, lau(command))]))
+    return ack_codes(control)
+
+
+def description2(control):
+    configs = [m for m in control.outbox if m.PGN == 126998]
+    control.outbox = []
+    decoded = decode(126998, encode(configs[-1]))
+    assert field(decoded, 'installationDescription1').value == control.settings['description'].value
+    return field(decoded, 'installationDescription2').value
+
+
+def test_text_get_watched_value():
+    control, client, clock = make_control()
+    assert text(control, 'PP:ap.mode') == (nc.PGN_ACK, [0])
+    control.poll()
+    assert control.description2 == 'ap.mode="compass"'
+
+
+def test_text_get_unwatched_value():
+    control, client, clock = make_control()
+    text(control, 'PP:servo.voltage')
+    assert client.watches['servo.voltage'] is True
+    control.on_value('servo.voltage', 12.5)
+    control.poll()
+    assert control.description2 == 'servo.voltage=12.5'
+    assert client.watches['servo.voltage'] is False
+
+
+def test_text_get_unknown_times_out():
+    control, client, clock = make_control()
+    text(control, 'PP:nope')
+    clock.t += 3
+    control.poll()
+    assert control.description2 == 'ERR unknown nope'
+
+
+def test_text_set_requires_full():
+    control, client, clock = make_control(level='steer')
+    text(control, 'PP:ap.pilot.basic.P=0.004')
+    assert client.sent == []
+    assert description2(control).startswith('ERR')
+
+
+def test_text_set_and_read_back():
+    control, client, clock = make_control(level='full', values={
+        'ap.pilot.basic.P': {'type': 'RangeProperty', 'min': 0, 'max': .03, 'writable': True}})
+    text(control, 'PP:ap.pilot.basic.P=0.004')
+    assert client.sent == ['ap.pilot.basic.P=0.004\n']
+    control.on_value('ap.pilot.basic.P', .004)
+    control.poll()
+    assert control.description2 == ''.join(['PP:HELP'])  # not reported before the read-back delay
+    clock.t += .6
+    control.poll()
+    assert control.description2 == 'OK ap.pilot.basic.P=0.004'
+
+
+def test_text_set_denied_names():
+    control, client, clock = make_control(level='full', values={
+        'servo.flags': {'type': 'Value'}})
+    for command in ['PP:n2k.transport="none"', 'PP:imu.alignmentQ=[1,0,0,0]',
+                    'PP:imu.compass.calibration.points=[]', 'PP:servo.flags=0',
+                    'PP:ap.mode=compass']:
+        text(control, command)
+        assert description2(control).startswith('ERR'), command
+    assert client.sent == []
+
+
+def test_text_set_allows_n2k_outputs():
+    control, client, clock = make_control(level='full')
+    text(control, 'PP:n2k.output.rudder=true')
+    assert client.sent == ['n2k.output.rudder=true\n']
+
+
+def test_text_info_and_list():
+    info = {'ap.pilot.basic.%s' % g: {'type': 'RangeProperty', 'min': 0, 'max': 1, 'writable': True}
+            for g in ['P', 'D', 'DD', 'PR', 'FF']}
+    info.update({'ap.pilot.simple.%s%d' % (g, i): {} for g in 'PID' for i in range(5)})
+    control, client, clock = make_control(values=info)
+    text(control, 'PP:INFO ap.pilot.basic.P')
+    assert description2(control) == 'RangeProperty 0..1 writable'
+    text(control, 'PP:LIST ap.pilot.basic')
+    assert description2(control) == 'ap.pilot.basic: .D .DD .FF .P .PR'
+    text(control, 'PP:LIST ap.pilot.simple')
+    first = description2(control)
+    assert first.startswith('ap.pilot.simple: .D0 .D1') and first.endswith('(+1)')
+    assert len(first) <= nc.TEXT_LENGTH
+    text(control, 'PP:LIST ap.pilot.simple 1')
+    second = description2(control)
+    assert second.startswith('ap.pilot.simple: ') and second.endswith('.P4')
+    text(control, 'PP:LIST ap.pilot.simple 2')
+    assert description2(control) == 'ERR no page 2'
+
+
+def test_plain_description_is_stored():
+    control, client, clock = make_control(level='monitor')
+    text(control, 'nav station')
+    assert control.settings['description'].value == 'nav station'
+    assert control.gateway.installation_description1 == 'nav station'
+
+
+def test_description2_not_writable():
+    control, client, clock = make_control()
+    control.handle_group_function(Source(), command_payload(126998, [(2, lau('x'))]))
+    assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_ACCESS_DENIED])
+
+
+def test_long_result_truncated():
+    control, client, clock = make_control(**{'profiles': ['p%d' % i for i in range(40)]})
+    text(control, 'PP:profiles')
+    control.poll()
+    assert len(control.description2) == nc.TEXT_LENGTH
+    assert control.description2.endswith('...')
+
+
+# ---- alerts -----------------------------------------------------------------
+
+def alert_response(alert_id, occurrence, response, source_name=OWN_NAME):
+    fields = {'alertType': nc.Lookup(2), 'alertCategory': nc.Lookup(1),
+              'alertSystem': nc.ALERT_SYSTEM, 'alertSubSystem': 0, 'alertId': alert_id,
+              'dataSourceNetworkIdName': source_name, 'dataSourceInstance': 0,
+              'dataSourceIndexSource': 0, 'alertOccurrenceNumber': occurrence,
+              'acknowledgeSourceNetworkIdName': OTHER_NAME,
+              'responseCommand': nc.Lookup(response), 'reserved_194': None}
+    message = decode(126984, encode(nc.make_message(126984, fields)))
+    message.source_iso_name = None
+    return message
+
+
+def test_servo_fault_alert_lifecycle():
+    control, client, clock = make_control(enabled=True)
+    control.poll()
+    control.values['servo.flags'] = 'SYNC OVERCURRENT_FAULT'
+    clock.t += 1
+    messages = control.poll()
+    alert = decode(126983, encode([m for m in messages if m.PGN == 126983][0]))
+    alert_text = decode(126985, encode([m for m in messages if m.PGN == 126985][0]))
+    assert field(alert, 'alertId').value == nc.ALERT_SERVO_OVERCURRENT
+    assert field(alert, 'alertType').raw_value == nc.ALERT_ALARM
+    assert field(alert, 'alertState').raw_value == nc.STATE_ACTIVE
+    assert field(alert_text, 'alertTextDescription').value == 'Autopilot servo overcurrent'
+
+    control.handle_message(alert_response(nc.ALERT_SERVO_OVERCURRENT, 1, nc.RESPONSE_ACKNOWLEDGE))
+    clock.t += .1
+    alert = decode(126983, encode(sent(control, 126983)[0]))
+    assert field(alert, 'alertState').raw_value == nc.STATE_ACKNOWLEDGED
+
+    control.values['servo.flags'] = 'SYNC'
+    clock.t += .1
+    alert = decode(126983, encode(sent(control, 126983)[0]))
+    assert field(alert, 'alertState').raw_value == nc.STATE_NORMAL
+
+
+def test_alert_response_for_other_device_ignored():
+    control, client, clock = make_control(**{'imu.error': 'No IMU'})
+    control.poll()
+    control.handle_message(alert_response(nc.ALERT_IMU_ERROR, 1, nc.RESPONSE_ACKNOWLEDGE, OTHER_NAME))
+    assert not control.alerts[nc.ALERT_IMU_ERROR].acknowledged
+
+
+def test_dismiss_switch_acknowledges_alerts():
+    control, client, clock = make_control(**{'imu.warning': 'compass calibration age'})
+    control.poll()
+    control.handle_message(switch_message(ch16=nc.SWITCH_ON))
+    assert control.alerts[nc.ALERT_COMPASS_WARNING].acknowledged
+
+
+def test_mode_fallback_alert():
+    control, client, clock = make_control(mode='compass', enabled=True, **{'ap.preferred_mode': 'wind'})
+    alerts = [decode(126983, encode(m)) for m in sent(control, 126983)]
+    assert [field(a, 'alertId').value for a in alerts] == [nc.ALERT_MODE_FALLBACK]
+
+
+def test_no_alerts_without_output():
+    control, client, clock = make_control(**{'imu.error': 'No IMU'})
+    control.settings['output'].value = False
+    assert sent(control, 126983) == []
