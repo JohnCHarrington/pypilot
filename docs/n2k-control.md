@@ -44,7 +44,7 @@ autopilot is controlled the same way:
 | Tack (auto, port, starboard; cancel) | B |
 | Manual steering: pulse jog | A (non-follow-up), B |
 | Manual steering: rudder angle (needs rudder sensor) | A (follow-up) |
-| Choose profile | B (next profile), C |
+| Choose profile, select mode without engaging | B (next profile, next mode), C |
 | Pilot, gains, servo/motor settings, rudder calibration, level, heading offset, compass cal lock, reset counters, NMEA/Signal K/GPS settings | C |
 | Faults and warnings shown on MFDs, acknowledged from MFDs | Alerts |
 
@@ -161,7 +161,8 @@ instance will fight.
 | 15 | JOG STBD | One jog pulse to starboard (standby only) | Momentary echo |
 | 16 | DISMISS ALARM | Acknowledge all active pypilot alerts | ON while any alert is unacknowledged |
 | 17 | NEXT PROFILE | Switch to the next entry of `profiles` | Momentary echo |
-| 18–20 | *(reserved)* | Ignored | Off |
+| 18 | NEXT MODE | Select the next mode in `ap.modes` **without** engaging (the hat's mode key). If engaged, pypilot keeps the same course in the new mode | Momentary echo |
+| 19–20 | *(reserved)* | Ignored | Off |
 | 21 | — | *(status only)* | ON while a servo fault is active |
 | 22 | — | *(status only)* | ON while there's an IMU/compass error |
 | 23 | — | *(status only)* | ON while the active mode ≠ preferred mode (sensor-loss fallback) |
@@ -177,7 +178,7 @@ instance will fight.
 - **OFF never starts an action.** In particular, turning off a mode channel
   does **not** disengage. A momentary button's OFF arrives milliseconds after
   its ON, so treating OFF as standby would cancel every press. Use STANDBY.
-- **Momentary channels** (7–10, 14, 15, 17) show ON in 127501 for 0.5 s after
+- **Momentary channels** (7–10, 14, 15, 17, 18) show ON in 127501 for 0.5 s after
   acting, then OFF.
 - **Rejected presses** have no ack in 127502. When a press is rejected (mode
   not available, adjust while tacking, jog while engaged, control level too
@@ -209,8 +210,9 @@ Each field holds about 70 characters, so commands and results are short.
 
 | Command | Meaning | Result in Description 2 |
 |---|---|---|
-| `PP:<name>` | Read a value | `<name>=<json>`, truncated with `…` if too long |
-| `PP:<name>=<json>` | Write a value (same syntax as pypilot's TCP protocol) | `OK <name>=<json>` with the value actually applied (after clamping), or `ERR <reason>` |
+| `PP:<name>` | Read a value | `<name>=<json>`, truncated with `...` if too long |
+| `PP:<name>@<offset>` | Read part of a long value, starting at character `offset` of its compact JSON | `<name>@<offset>/<total>=<chunk>`. Read again from `offset + len(chunk)` until reaching `total` |
+| `PP:<name>=<json>` | Write a value (same syntax as pypilot's TCP protocol) | `OK <name>=<json>` with the value actually applied (after clamping or rounding), or `ERR <reason>` |
 | `PP:INFO <name>` | Type, range and choices | e.g. `RangeProperty 0..0.03 persistent profiled` |
 | `PP:LIST <prefix> [n]` | Value names starting with prefix, page `n`. The prefix is shown once, then the rest of each name. | `ap.pilot.basic: .D .DD .FF .P .PR`, or with more pages: `… (+2)` |
 | `PP:HELP` | Command summary | |
@@ -224,6 +226,28 @@ Examples:
 - `PP:servo.faults=0`
 
 Writes need control level `full`. Reads and `LIST`/`INFO` need `monitor`.
+
+**Request tags.** Prefix a command with a tag of 1–8 letters or digits, as
+`PP#<tag>:<command>`, and the result starts with `#<tag> `. For example,
+`PP#12:ap.mode` gives `#12 ap.mode="compass"`. Results are broadcast in one
+shared field, so a tool that might share the bus with another should tag its
+commands and ignore results that aren't its own. Only one command is in
+progress at a time; a new command replaces one still waiting for its value.
+
+### 5.2 Timing
+
+- **Reads are answered as soon as the value is known.** pypilot answers
+  immediately, inside the command handler, when it already has a live value,
+  meaning one its N2K process watches anyway. Otherwise it starts watching the
+  value and answers when pypilot sends it.
+- **Values read once stay watched for 30 s.** Every read renews this, so a
+  control head polling a few values gets immediate answers after the first
+  read. At most 32 values are kept this way; the oldest is dropped first.
+- **Writes are answered when pypilot reports the new value.** If no update
+  matching the requested value arrives within 0.5 s (because it was clamped,
+  rounded, or was already the current value), the result reports whatever the
+  value is then.
+- **Reads that get no value within 2 s** report `ERR unknown <name>`.
 
 ## 6. Access control and safety
 

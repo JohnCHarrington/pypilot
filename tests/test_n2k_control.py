@@ -4,6 +4,7 @@ Tests for N2K control of pypilot (pypilot/n2k_control.py, docs/n2k-control.md).
 Messages are round-tripped through the nmea2000 library's generated
 encoders/decoders so the field layouts are checked against the real codec.
 """
+import json
 import math
 
 import pytest
@@ -35,7 +36,10 @@ class FakeClient:
         self.sent.append(msg)
 
     def watch(self, name, value=True):
-        self.watches[name] = value
+        if value is False:
+            self.watches.pop(name, None)
+        else:
+            self.watches[name] = value
 
 
 class Clock:
@@ -70,6 +74,8 @@ def make_control(level='steer', bank=1, mode='compass', enabled=False, **values)
                 'jog_pulse': Setting(.3), 'description': Setting('saloon'),
                 'output': Setting(True)}
     control = nc.N2KControl(client, v, settings, now=clock)
+    for name in nc.WATCHES:  # as the bridge does
+        client.watch(name)
     control.attach(Gateway())
     return control, client, clock
 
@@ -473,7 +479,43 @@ def test_text_get_unwatched_value():
     control.on_value('servo.voltage', 12.5)
     control.poll()
     assert control.description2 == 'servo.voltage=12.5'
-    assert client.watches['servo.voltage'] is False
+    # it stays watched for a while so repeat reads are immediate, then the watch is dropped
+    assert client.watches['servo.voltage'] is True
+    clock.t += nc.TEXT_LEASE + 1
+    control.poll()
+    assert 'servo.voltage' not in client.watches
+    assert 'servo.voltage' not in control.values
+
+
+def test_text_repeat_read_answered_immediately_from_lease():
+    control, client, clock = make_control()
+    text(control, 'PP:servo.voltage')
+    control.on_value('servo.voltage', 12.5)
+    control.on_value('servo.voltage', 12.1)  # kept up to date while leased
+    text(control, 'PP:servo.voltage')
+    assert description2(control) == 'servo.voltage=12.1'  # answered in the handler, no poll
+
+
+def test_text_does_not_reuse_value_after_lease():
+    control, client, clock = make_control()
+    text(control, 'PP:servo.voltage')
+    control.on_value('servo.voltage', 12.5)
+    clock.t += nc.TEXT_LEASE + 1
+    control.poll()
+    text(control, 'PP:servo.voltage')
+    assert control.pending_text is not None  # waits for a fresh value
+    control.on_value('servo.voltage', 12.0)
+    assert description2(control) == 'servo.voltage=12.0'
+
+
+def test_text_lease_limit_drops_oldest():
+    control, client, clock = make_control()
+    for i in range(nc.MAX_TEXT_LEASES + 1):
+        text(control, 'PP:x.v%d' % i)
+        control.on_value('x.v%d' % i, i)
+        clock.t += .01
+    assert len(control.leases) == nc.MAX_TEXT_LEASES
+    assert 'x.v0' not in client.watches and 'x.v1' in client.watches
 
 
 def test_text_get_unknown_times_out():
@@ -496,12 +538,75 @@ def test_text_set_and_read_back():
         'ap.pilot.basic.P': {'type': 'RangeProperty', 'min': 0, 'max': .03, 'writable': True}})
     text(control, 'PP:ap.pilot.basic.P=0.004')
     assert client.sent == ['ap.pilot.basic.P=0.004\n']
-    control.on_value('ap.pilot.basic.P', .004)
-    control.poll()
-    assert control.description2 == ''.join(['PP:HELP'])  # not reported before the read-back delay
-    clock.t += .6
-    control.poll()
+    control.on_value('ap.pilot.basic.P', .003)  # the value before the write: not the answer
+    assert control.description2 == 'PP:HELP'
+    control.on_value('ap.pilot.basic.P', .004)  # reported as soon as pypilot applies it
     assert control.description2 == 'OK ap.pilot.basic.P=0.004'
+
+
+def test_text_set_reports_clamped_value_after_settle():
+    control, client, clock = make_control(level='full')
+    text(control, 'PP:ap.pilot.basic.P=5')
+    control.on_value('ap.pilot.basic.P', .03)  # clamped to its maximum
+    control.poll()
+    assert control.description2 == 'PP:HELP'
+    clock.t += nc.WRITE_SETTLE
+    control.poll()
+    assert control.description2 == 'OK ap.pilot.basic.P=0.03'
+
+
+def test_text_set_same_value_as_live_is_immediate():
+    control, client, clock = make_control(level='full')
+    text(control, 'PP:ap.mode="compass"')
+    assert description2(control) == 'OK ap.mode="compass"'
+
+
+def test_text_tags():
+    control, client, clock = make_control()
+    text(control, 'PP#7a:ap.mode')
+    assert description2(control) == '#7a ap.mode="compass"'
+    text(control, 'PP#x1:servo.voltage')
+    control.on_value('servo.voltage', 12.5)
+    assert description2(control) == '#x1 servo.voltage=12.5'
+    text(control, 'PP#toolongtag:ap.mode')
+    assert description2(control).startswith('ERR tag')
+    text(control, 'PP#9:INFO nope')
+    assert description2(control) == '#9 ERR unknown nope'
+
+
+def test_text_chunked_read():
+    points = [[round(i * 1.1, 1), -i, i * 2] for i in range(30)]
+    control, client, clock = make_control(**{'imu.compass.calibration.points': points})
+    client.watch('imu.compass.calibration.points')
+    full = json.dumps(points, separators=(',', ':'))
+    got, offset = '', 0
+    while True:
+        text(control, 'PP#3:imu.compass.calibration.points@%d' % offset)
+        result = description2(control)
+        assert len(result) <= nc.TEXT_LENGTH
+        header, chunk = result.split('=', 1)
+        assert header == '#3 imu.compass.calibration.points@%d/%d' % (offset, len(full))
+        got += chunk
+        offset += len(chunk)
+        if offset >= len(full):
+            break
+    assert json.loads(got) == points
+    text(control, 'PP:imu.compass.calibration.points@%d' % (len(full) + 1))
+    assert description2(control).startswith('ERR offset past end')
+    text(control, 'PP:imu.compass.calibration.points@x')
+    assert description2(control).startswith('ERR offset')
+
+
+def test_next_mode_channel_cycles_without_engaging():
+    control, client, clock = make_control()
+    control.handle_message(switch_message(ch18=nc.SWITCH_ON))
+    assert client.sets == [('ap.mode', 'gps')]
+    control.handle_message(switch_message(ch18=nc.SWITCH_OFF))
+    control.handle_message(switch_message(ch18=nc.SWITCH_ON))
+    control.handle_message(switch_message(ch18=nc.SWITCH_OFF))
+    control.handle_message(switch_message(ch18=nc.SWITCH_ON))
+    assert [v for n, v in client.sets if n == 'ap.mode'] == ['gps', 'wind', 'compass']
+    assert 'ap.enabled' not in sets(client)
 
 
 def test_text_set_denied_names():

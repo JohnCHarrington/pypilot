@@ -42,8 +42,9 @@ CH_TACK = {11: None, 12: 'port', 13: 'starboard'}
 CH_JOG = {14: -1, 15: 1}
 CH_DISMISS = 16
 CH_NEXT_PROFILE = 17
+CH_NEXT_MODE = 18
 CH_SERVO_FAULT, CH_IMU_ERROR, CH_MODE_FALLBACK = 21, 22, 23
-MOMENTARY_CHANNELS = list(CH_ADJUST) + list(CH_JOG) + [CH_NEXT_PROFILE]
+MOMENTARY_CHANNELS = list(CH_ADJUST) + list(CH_JOG) + [CH_NEXT_PROFILE, CH_NEXT_MODE]
 
 MOMENTARY_TIME = .5   # momentary channels show ON this long after acting
 SWITCH_REARM_TIME = 1 # a channel left ON re-arms after this long
@@ -55,6 +56,10 @@ STATUS_PERIOD = 1
 STATUS_MIN_PERIOD = .2
 ALERT_TEXT_PERIOD = 10
 JOG_SPEED = 1
+TEXT_LEASE = 30       # a value read with PP: stays watched this long, so repeat reads are immediate
+MAX_TEXT_LEASES = 32
+WRITE_SETTLE = .5     # longest a PP: write waits for pypilot to report the new value
+TEXT_TIMEOUT = 2
 TEXT_LENGTH = 70      # usable characters in an installation description
 
 # alert type, category and state lookups
@@ -223,6 +228,22 @@ def truncate(text, length=TEXT_LENGTH):
     return text
 
 
+def split_text_command(text):
+    '''"PP:command" or "PP#tag:command" -> (tag or None, command), None if malformed'''
+    if text.startswith('PP:'):
+        return None, text[3:].strip()
+    tag, sep, command = text[3:].partition(':')
+    if not sep or not tag or len(tag) > 8 or not tag.isalnum():
+        return None
+    return tag, command.strip()
+
+
+def values_match(value, expected):
+    if is_number(value) and is_number(expected):
+        return abs(value - expected) <= 1e-9 + 1e-6 * abs(expected)
+    return value == expected
+
+
 def denied_write(name):
     if name.startswith('n2k.'):
         return not (name.startswith('n2k.output.') or name == 'n2k.installation_description')
@@ -266,7 +287,9 @@ class N2KControl(object):
         self.follow_up = None     # (time, angle in rad) of the last follow-up command
         self.switches_on = {}     # channel -> time it was turned on
         self.momentary_until = {}
-        self.pending_text = None  # outstanding PP: read
+        self.pending_text = None  # outstanding PP: read or write
+        self.text_tag = None      # tag of the PP# command being run
+        self.leases = {}          # values watched for PP: reads -> expiry time
         self.description2 = 'PP:HELP'
         self.reject_until = 0
         self.last_127237 = (0, None)
@@ -434,6 +457,16 @@ class N2KControl(object):
         self.jog_end = None
         self.set('servo.command', 0)
 
+    def next_mode(self):
+        '''select the next available mode without engaging, like the hat's mode key'''
+        modes = self.values.get('ap.modes') or []
+        mode = self.values.get('ap.mode')
+        if len(modes) < 2:
+            return self.reject('no other mode available')
+        i = modes.index(mode) + 1 if mode in modes else 0
+        self.set('ap.mode', modes[i % len(modes)])
+        return True
+
     def next_profile(self):
         profiles = self.values.get('profiles') or []
         if not profiles:
@@ -528,20 +561,25 @@ class N2KControl(object):
         for index, text in params:
             if index != 1:
                 errors.append(PARAM_ACCESS_DENIED)  # description 2 is our output
-            elif text.startswith('PP:'):
+            elif text.startswith('PP:') or text.startswith('PP#'):
                 if not self.permitted(MONITOR, message):
                     errors.append(PARAM_ACCESS_DENIED)
                     continue
                 errors.append(PARAM_ACK)
-                self.text_command(text[3:].strip(), message)
+                split = split_text_command(text)
+                if split:
+                    self.text_command(split[1], message, split[0])
+                else:
+                    self.text_result('ERR tag must be 1-8 letters or digits')
             else:
                 errors.append(PARAM_ACK)
                 self.settings['description'].set(text)
                 self.send_126998()
         return PGN_ACK, errors
 
-    def text_result(self, text):
-        self.description2 = truncate(text)
+    def text_result(self, text, tag=None):
+        tag = self.text_tag if tag is None else tag
+        self.description2 = truncate(('#%s ' % tag if tag else '') + text)
         self.send_126998()
 
     def value_list(self):
@@ -556,10 +594,17 @@ class N2KControl(object):
         info = self.value_list()
         return info.get(name) if info else None
 
-    def text_command(self, command, message):
+    def text_command(self, command, message, tag=None):
+        self.text_tag = tag
+        try:
+            self.run_text_command(command, message, tag)
+        finally:
+            self.text_tag = None
+
+    def run_text_command(self, command, message, tag):
         word = command.split(' ', 1)[0].upper()
         if not command or word == 'HELP':
-            return self.text_result('PP:name | PP:name=json | PP:INFO name | PP:LIST prefix [page]')
+            return self.text_result('PP:name[@offset] | PP:name=json | PP:INFO name | PP:LIST prefix [page]')
 
         if word == 'INFO':
             name = command[5:].strip()
@@ -598,14 +643,20 @@ class N2KControl(object):
             if info is not None and not info.get('writable'):
                 return self.text_result('ERR %s is read only' % name)
             try:
-                json.loads(value)
+                expected = json.loads(value)
             except ValueError:
                 return self.text_result('ERR value must be json')
             self.client.send(name + '=' + value + '\n')
-            # read back what pypilot actually applied, after it has had time to clamp it
-            return self.request_value(name, 'OK ', delay=.5)
+            # report what pypilot actually applied, which may be clamped or rounded
+            return self.request_value(name, tag, write=expected)
 
-        return self.request_value(command, '', delay=0)
+        name, offset = command, None
+        if '@' in command:
+            name, _, offset = command.partition('@')
+            if not offset.isdigit():
+                return self.text_result('ERR offset must be a number')
+            offset = int(offset)
+        return self.request_value(name.strip(), tag, offset=offset)
 
     def list_page(self, prefix, names, page):
         # pack as many names as fit, each page continuing where the last stopped
@@ -625,30 +676,61 @@ class N2KControl(object):
             text += ' (+%d)' % (len(pages) - page - 1)
         return text
 
-    def request_value(self, name, prefix, delay):
-        if self.pending_text and self.pending_text['watch']:
-            self.client.watch(self.pending_text['name'], False)
-        now = self.now()
-        watched = name in self.values
-        self.pending_text = {'name': name, 'prefix': prefix, 'ready': now + delay,
-                             'deadline': now + max(delay, 0) + 2, 'watch': not watched,
-                             'value': self.values.get(name), 'have': watched}
-        if not watched:
+    def lease(self, name, now):
+        '''Keep a value read with PP: watched for a while, so repeat reads (a control
+        head polling a few values) are answered at once from a live value.'''
+        watches = getattr(self.client, 'watches', {})
+        if name not in self.leases and name in watches:
+            return  # the bridge watches it anyway
+        if name not in self.leases:
+            if len(self.leases) >= MAX_TEXT_LEASES:
+                self.end_lease(min(self.leases, key=self.leases.get))
+            self.values.pop(name, None)  # stale until the watch delivers
             self.client.watch(name)
+        self.leases[name] = now + TEXT_LEASE
+
+    def end_lease(self, name):
+        del self.leases[name]
+        self.client.watch(name, False)
+        self.values.pop(name, None)  # no longer kept up to date
+
+    def request_value(self, name, tag, write=None, offset=None):
+        now = self.now()
+        live = name in self.values and (name in self.leases or
+                                        name in getattr(self.client, 'watches', {}))
+        self.lease(name, now)
+        self.pending_text = {'name': name, 'tag': tag, 'write': write, 'offset': offset, 'start': now}
+        if live and (write is None or values_match(self.values[name], write)):
+            self.finish_text()
+
+    def finish_text(self):
+        pending, self.pending_text = self.pending_text, None
+        name, tag, offset = pending['name'], pending['tag'], pending['offset']
+        value = self.values[name]
+        if offset is None:
+            prefix = 'OK ' if pending['write'] is not None else ''
+            return self.text_result('%s%s=%s' % (prefix, name, json.dumps(value)), tag)
+        # a slice of a long value: name@offset/total=chunk, compact json
+        text = json.dumps(value, separators=(',', ':'))
+        if offset > len(text):
+            return self.text_result('ERR offset past end of %s (%d)' % (name, len(text)), tag)
+        header = '%s@%d/%d=' % (name, offset, len(text))
+        room = TEXT_LENGTH - len(header) - (len(tag) + 2 if tag else 0)
+        self.text_result(header + text[offset:offset + max(room, 0)], tag)
 
     def poll_text(self, now):
+        for name, expiry in list(self.leases.items()):
+            if now > expiry and not (self.pending_text and self.pending_text['name'] == name):
+                self.end_lease(name)
         pending = self.pending_text
-        if not pending or now < pending['ready']:
+        if not pending:
             return
-        if pending['have'] or now >= pending['deadline']:
-            if pending['watch']:
-                self.client.watch(pending['name'], False)
+        elapsed = now - pending['start']
+        if pending['write'] is not None and elapsed >= WRITE_SETTLE and pending['name'] in self.values:
+            self.finish_text()  # no update matching the request: report what it is now
+        elif elapsed >= TEXT_TIMEOUT:
             self.pending_text = None
-            if pending['have']:
-                self.text_result('%s%s=%s' % (pending['prefix'], pending['name'],
-                                              json.dumps(pending['value'])))
-            else:
-                self.text_result('ERR unknown ' + pending['name'])
+            self.text_result('ERR unknown ' + pending['name'], pending['tag'])
 
     # ---- path B: switch bank --------------------------------------------------
 
@@ -681,7 +763,7 @@ class N2KControl(object):
         elif channel == CH_DISMISS:
             needed = MONITOR
         elif channel in CH_MODES or channel in CH_ADJUST or channel in CH_TACK or \
-             channel in CH_JOG or channel == CH_NEXT_PROFILE:
+             channel in CH_JOG or channel in [CH_NEXT_PROFILE, CH_NEXT_MODE]:
             needed = STEER
         else:
             return  # reserved or status only channel
@@ -701,6 +783,8 @@ class N2KControl(object):
             done = self.jog(CH_JOG[channel])
         elif channel == CH_DISMISS:
             done = self.acknowledge_all()
+        elif channel == CH_NEXT_MODE:
+            done = self.next_mode()
         else:
             done = self.next_profile()
 
@@ -986,6 +1070,7 @@ class N2KControl(object):
 
     def on_value(self, name, value):
         '''called by the bridge for every value received from pypilot'''
+        self.values[name] = value
         pending = self.pending_engage
         if pending:
             if name == 'ap.mode' and value == pending['mode']:
@@ -999,8 +1084,9 @@ class N2KControl(object):
                 self.set('ap.heading_command', value if command is None else command)
                 self.set('ap.enabled', True)
         text = self.pending_text
-        if text and name == text['name']:
-            text['value'], text['have'] = value, True
+        if text and name == text['name'] and \
+                (text['write'] is None or values_match(value, text['write'])):
+            self.finish_text()
 
     def handle_message(self, message):
         '''called by the bridge for received PGNs, True if it was ours'''
