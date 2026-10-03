@@ -731,6 +731,33 @@ def test_no_alerts_without_output():
     assert sent(control, 126983) == []
 
 
+class OwnValues:
+    """pypilotClient.values for a process that registered values itself"""
+    def __init__(self, **values):
+        self.values = {name.replace('__', '.'): Setting(v) for name, v in values.items()}
+        self.value = None
+
+
+def test_text_reads_values_registered_by_this_process():
+    # the n2k.* settings belong to pypilot's n2k process: never received, read directly
+    control, client, clock = make_control()
+    client.values = OwnValues(n2k__switch__bank=5)
+    text(control, 'PP:n2k.switch.bank')
+    assert description2(control) == 'n2k.switch.bank=5'
+    assert 'n2k.switch.bank' not in client.watches
+
+
+def test_text_write_of_own_value_reported_after_settle():
+    control, client, clock = make_control(level='full')
+    client.values = OwnValues(n2k__output__rudder=False)
+    text(control, 'PP:n2k.output.rudder=true')
+    assert client.sent == ['n2k.output.rudder=true\n']
+    client.values.values['n2k.output.rudder'].value = True  # the server hands the write back to us
+    clock.t += nc.WRITE_SETTLE
+    control.poll()
+    assert control.description2 == 'OK n2k.output.rudder=true'
+
+
 def test_text_list_uses_client_value_list():
     # pypilotClient keeps the 'values' list in client.values.value, not in receive()
     control, client, clock = make_control()

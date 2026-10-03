@@ -694,19 +694,40 @@ class N2KControl(object):
         self.client.watch(name, False)
         self.values.pop(name, None)  # no longer kept up to date
 
+    def own_value(self, name):
+        '''(True, value) for a value this process registered itself, such as the
+        n2k.* settings: its client keeps those and never reports them as received'''
+        own = getattr(getattr(self.client, 'values', None), 'values', None)
+        if isinstance(own, dict) and name in own and name not in ('values', 'watch'):
+            return True, own[name].value
+        return False, None
+
+    def current_value(self, name):
+        own, value = self.own_value(name)
+        if own:
+            return True, value
+        if name in self.values:
+            return True, self.values[name]
+        return False, None
+
     def request_value(self, name, tag, write=None, offset=None):
         now = self.now()
-        live = name in self.values and (name in self.leases or
-                                        name in getattr(self.client, 'watches', {}))
-        self.lease(name, now)
+        own, value = self.own_value(name)
+        if own:
+            live = True
+        else:
+            live = name in self.values and (name in self.leases or
+                                            name in getattr(self.client, 'watches', {}))
+            value = self.values.get(name)
+            self.lease(name, now)
         self.pending_text = {'name': name, 'tag': tag, 'write': write, 'offset': offset, 'start': now}
-        if live and (write is None or values_match(self.values[name], write)):
+        if live and (write is None or values_match(value, write)):
             self.finish_text()
 
     def finish_text(self):
         pending, self.pending_text = self.pending_text, None
         name, tag, offset = pending['name'], pending['tag'], pending['offset']
-        value = self.values[name]
+        value = self.current_value(name)[1]
         if offset is None:
             prefix = 'OK ' if pending['write'] is not None else ''
             return self.text_result('%s%s=%s' % (prefix, name, json.dumps(value)), tag)
@@ -726,7 +747,7 @@ class N2KControl(object):
         if not pending:
             return
         elapsed = now - pending['start']
-        if pending['write'] is not None and elapsed >= WRITE_SETTLE and pending['name'] in self.values:
+        if pending['write'] is not None and elapsed >= WRITE_SETTLE and self.current_value(pending['name'])[0]:
             self.finish_text()  # no update matching the request: report what it is now
         elif elapsed >= TEXT_TIMEOUT:
             self.pending_text = None
