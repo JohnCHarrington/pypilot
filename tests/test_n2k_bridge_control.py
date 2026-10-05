@@ -19,6 +19,7 @@ class FakeClient:
         self.sets = []
         self.watches = {}
         self.received = {}
+        self.received_data = True
 
     def register(self, value):
         self.registered[value.name] = value
@@ -132,3 +133,52 @@ def test_gps_timestamp_is_epoch_seconds():
         nmea2000.NMEA2000Field(id='time', value=datetime.time(16, 26, 3, 500000))])
     assert n2k.gps_timestamp(message) == 1790958363.5
     assert n2k.gps_timestamp(nmea2000.NMEA2000Message(PGN=129033, fields=[])) is None
+
+
+def startup_bridge(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(n2k.time, 'monotonic', lambda: clock[0])
+    bridge = n2k.N2KBridge.__new__(n2k.N2KBridge)
+    bridge.client = FakeClient()
+    bridge.client.received_data = False
+    asyncio.run(bridge.setup())
+    starts = []
+
+    async def init_transport():
+        starts.append(bridge.n2k_transport.value)
+        bridge.transport_config = bridge.current_transport_config()
+    bridge.init_transport = init_transport
+
+    def poll(dt):
+        clock[0] += dt
+        asyncio.run(bridge.ensure_transport())
+    return bridge, starts, poll
+
+
+def test_transport_waits_for_persistent_settings(monkeypatch):
+    bridge, starts, poll = startup_bridge(monkeypatch)
+    for i in range(20):  # no data from the server yet
+        poll(.1)
+    assert starts == []
+
+    bridge.client.received_data = True
+    poll(.1)
+    bridge.n2k_transport.set('socketcan')  # persistent setting arrives
+    bridge.n2k_interface.set('can1')
+    for i in range(9):
+        poll(.1)
+    assert starts == []  # still settling
+    for i in range(20):
+        poll(.1)
+    assert starts == ['socketcan']  # started once, with the stored settings
+
+    bridge.n2k_interface.set('can0')  # later changes restart immediately
+    poll(.1)
+    assert starts == ['socketcan', 'socketcan']
+
+
+def test_transport_starts_without_server_data(monkeypatch):
+    bridge, starts, poll = startup_bridge(monkeypatch)
+    for i in range(int(bridge.SETTINGS_MAX_WAIT / .1) + 1):
+        poll(.1)
+    assert starts == ['none']

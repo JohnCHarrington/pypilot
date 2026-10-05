@@ -43,6 +43,13 @@ def gps_timestamp(message):
 
 
 class N2KBridge(object):
+    # The persistent n2k.* settings arrive from the server some time after
+    # they are registered.  Starting the transport with the defaults first
+    # would start it twice at boot, so wait until data is arriving from the
+    # server and the transport settings have stopped changing.
+    SETTINGS_SETTLE_TIME = 1.0
+    SETTINGS_MAX_WAIT = 10.0
+
     def __init__(self, server):
         self.client = pypilotClient(server)
         self.client.connection.name += 'n2kbridge'
@@ -114,7 +121,9 @@ class N2KBridge(object):
 
         self.watch_gps_fix = False
         self.gateway = None
-        self.transport_config = False
+        self.transport_config = None  # transport not started yet
+        self.pending_transport_config = None
+        self.settings_start_time = self.pending_time = time.monotonic()
         self.poller = select.poll()
         self.fd_to_source = {}
         self.msgs = {}
@@ -124,7 +133,6 @@ class N2KBridge(object):
         self.control = n2k_control.N2KControl(self.client, self.last_values, control_settings)
 
         self.setup_watches()
-        await self.init_transport()
 
     def setup_watches(self):
         for name in self.last_values:
@@ -291,8 +299,19 @@ class N2KBridge(object):
             finally:
                 self.gateway = None
 
+    def settings_settled(self, config):
+        t = time.monotonic()
+        if config != self.pending_transport_config or not self.client.received_data:
+            self.pending_transport_config = config
+            self.pending_time = t
+        if t - self.settings_start_time >= self.SETTINGS_MAX_WAIT:
+            return True
+        return t - self.pending_time >= self.SETTINGS_SETTLE_TIME
+
     async def ensure_transport(self):
         current = self.current_transport_config()
+        if self.transport_config is None and not self.settings_settled(current):
+            return
         if current != self.transport_config:
             await self.init_transport()
 
