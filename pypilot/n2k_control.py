@@ -50,6 +50,7 @@ MOMENTARY_TIME = .5   # momentary channels show ON this long after acting
 SWITCH_REARM_TIME = 1 # a channel left ON re-arms after this long
 ENGAGE_TIMEOUT = 3
 ENGAGE_SETTLE = .5    # pypilot reports the new mode before its heading is in that mode
+REQUEST_TIMEOUT = 2   # a value we set that pypilot hasn't reported by then was refused or changed
 REJECT_ALERT_TIME = 5
 SILENCE_TIME = 30
 STATUS_PERIOD = 1
@@ -244,6 +245,13 @@ def values_match(value, expected):
     return value == expected
 
 
+def requested_match(value, requested):
+    '''pypilot reporting a value we set, allowing for it rounding numbers'''
+    if is_number(value) and is_number(requested):
+        return abs(value - requested) < .01
+    return value == requested
+
+
 def denied_write(name):
     if name.startswith('n2k.'):
         return not (name.startswith('n2k.output.') or name == 'n2k.installation_description')
@@ -282,6 +290,13 @@ class N2KControl(object):
         self.gateway = None
         self.outbox = []
 
+        # values we set that pypilot hasn't reported yet: name -> (value, time).
+        # Actions build on them, so +1 +1 +1 adds 3 even before pypilot has reported
+        # the first; status sent on the bus only shows what pypilot reports.
+        self.requested = {}
+        # status PGN -> time until which its next change is sent without waiting
+        # STATUS_MIN_PERIOD: the result of a command, rather than a value flapping
+        self.prompt_status = {}
         self.pending_engage = None
         self.jog_end = None
         self.follow_up = None     # (time, angle in rad) of the last follow-up command
@@ -317,9 +332,12 @@ class N2KControl(object):
             return OFF
 
     def bank(self):
-        bank = self.settings['bank'].value
-        if is_number(bank) and 0 <= bank <= 252:
-            return int(bank)
+        try:  # set with a slider, so round to an instance; -1 is off
+            bank = round(float(self.settings['bank'].value))
+        except (TypeError, ValueError):
+            return None
+        if 0 <= bank <= 252:
+            return bank
         return None
 
     def own_name(self):
@@ -368,10 +386,28 @@ class N2KControl(object):
 
     def set(self, name, value):
         self.client.set(name, value)
-        self.values[name] = value
+        now = self.now()
+        self.requested[name] = (value, now)
+        for pgn in (127237, 127501):
+            self.prompt_status[pgn] = now + REQUEST_TIMEOUT
+
+    def value(self, name, default=None):
+        '''what a value will be: as we set it if pypilot hasn't reported that yet,
+        otherwise as pypilot reports it. For actions; status uses self.values.'''
+        if name in self.requested:
+            value, t = self.requested[name]
+            if self.now() - t < REQUEST_TIMEOUT:
+                return value
+            del self.requested[name]
+        return self.values.get(name, default)
 
     def enabled(self):
+        '''engaged, as pypilot reports'''
         return self.values.get('ap.enabled') is True
+
+    def will_be_enabled(self):
+        '''engaged, including an engage or standby pypilot hasn't reported yet'''
+        return self.value('ap.enabled') is True
 
     def reject(self, reason):
         self.reject_until = self.now() + REJECT_ALERT_TIME
@@ -391,15 +427,15 @@ class N2KControl(object):
     def engage(self, mode=None, command=None):
         '''engage in mode (None keeps the current one), at command if given,
         otherwise holding the current heading'''
-        current = self.values.get('ap.mode')
+        current = self.value('ap.mode')
         if mode is None:
             mode = current
-        if mode not in (self.values.get('ap.modes') or []):
+        if mode not in (self.value('ap.modes') or []):
             return self.reject('%s mode not available' % mode)
 
         if mode != current:
             self.set('ap.mode', mode)
-            if self.enabled() and command is None:
+            if self.will_be_enabled() and command is None:
                 return True  # pypilot keeps the same course across the mode change
             # ap.heading is still in the old mode's frame, and pypilot resets
             # the command when it sees the new mode, so wait for that before
@@ -407,8 +443,8 @@ class N2KControl(object):
             self.pending_engage = {'mode': mode, 'command': command, 'time': self.now()}
             return True
 
-        if command is None and not self.enabled():
-            command = self.values.get('ap.heading')
+        if command is None and not self.will_be_enabled():
+            command = self.value('ap.heading')
         if command is not None:
             self.set('ap.heading_command', command)
         self.set('ap.enabled', True)
@@ -416,23 +452,23 @@ class N2KControl(object):
 
     def adjust(self, degrees):
         '''change the heading command, +ve to starboard'''
-        if not self.enabled():
+        if not self.will_be_enabled():
             return self.reject('not engaged')
-        if self.values.get('ap.tack.state', 'none') != 'none':
+        if self.value('ap.tack.state', 'none') != 'none':
             return self.reject('tacking')
-        command = self.values.get('ap.heading_command')
+        command = self.value('ap.heading_command')
         if not is_number(command):
             return self.reject('no heading command')
-        if 'wind' in str(self.values.get('ap.mode')):
+        if 'wind' in str(self.value('ap.mode')):
             degrees = -degrees  # wind angle decreases turning to starboard
         self.set('ap.heading_command', command + degrees)
         return True
 
     def tack(self, direction):
         '''tack to direction, None for the direction pypilot detected'''
-        if not self.enabled():
+        if not self.will_be_enabled():
             return self.reject('not engaged')
-        state = self.values.get('ap.tack.state', 'none')
+        state = self.value('ap.tack.state', 'none')
         if state in ['begin', 'waiting']:
             self.set('ap.tack.state', 'none')  # pressing again cancels
             return True
@@ -440,14 +476,14 @@ class N2KControl(object):
             return self.reject('already tacking')
         if direction:
             self.set('ap.tack.direction', direction)
-        elif self.values.get('ap.tack.direction', 'none') == 'none':
+        elif self.value('ap.tack.direction', 'none') == 'none':
             return self.reject('tack direction unknown')
         self.set('ap.tack.state', 'begin')
         return True
 
     def jog(self, direction):
         '''one short pulse of the servo, +1 starboard, -1 port'''
-        if self.enabled():
+        if self.will_be_enabled():
             return self.reject('engaged')
         self.set('servo.command', -JOG_SPEED * direction)  # servo.command is -ve to starboard
         self.jog_end = self.now() + self.settings['jog_pulse'].value
@@ -459,8 +495,8 @@ class N2KControl(object):
 
     def next_mode(self):
         '''select the next available mode without engaging, like the hat's mode key'''
-        modes = self.values.get('ap.modes') or []
-        mode = self.values.get('ap.mode')
+        modes = self.value('ap.modes') or []
+        mode = self.value('ap.mode')
         if len(modes) < 2:
             return self.reject('no other mode available')
         i = modes.index(mode) + 1 if mode in modes else 0
@@ -468,10 +504,10 @@ class N2KControl(object):
         return True
 
     def next_profile(self):
-        profiles = self.values.get('profiles') or []
+        profiles = self.value('profiles') or []
         if not profiles:
             return self.reject('no profiles')
-        profile = self.values.get('profile')
+        profile = self.value('profile')
         i = profiles.index(profile) + 1 if profile in profiles else 0
         self.set('profile', profiles[i % len(profiles)])
         return True
@@ -498,7 +534,7 @@ class N2KControl(object):
         if not self.permitted(needed, message):
             return PGN_ACCESS_DENIED, [PARAM_ACCESS_DENIED] * len(params)
 
-        mode = self.values.get('ap.mode')
+        mode = self.value('ap.mode')
         if steering in [STEERING_STANDALONE, STEERING_HEADING]:
             if reference == REFERENCE_MAGNETIC:
                 mode = 'compass'
@@ -513,7 +549,7 @@ class N2KControl(object):
             errors[5] = PARAM_OUT_OF_RANGE
 
         if steering in [STEERING_STANDALONE, STEERING_HEADING, STEERING_TRACK] and \
-           mode not in (self.values.get('ap.modes') or []):
+           mode not in (self.value('ap.modes') or []):
             errors[5] = PARAM_TEMPORARY_ERROR
         if reference is not None and reference not in [REFERENCE_TRUE, REFERENCE_MAGNETIC]:
             errors[7] = PARAM_OUT_OF_RANGE
@@ -538,14 +574,14 @@ class N2KControl(object):
         elif steering in [STEERING_STANDALONE, STEERING_HEADING, STEERING_TRACK]:
             self.engage(mode, command)
         elif steering == STEERING_NFU:
-            if self.enabled():
+            if self.will_be_enabled():
                 self.standby()
             if direction == RUDDER_NO_ORDER:
                 self.stop_jog()
             else:
                 self.jog(1 if direction == RUDDER_STARBOARD else -1)
         elif steering == STEERING_FU:
-            if self.enabled():
+            if self.will_be_enabled():
                 self.standby()
             self.follow_up = (self.now(), rudder)
             self.set('servo.position_command', -rad2deg(rudder))  # pypilot rudder is +ve to port
@@ -1092,6 +1128,8 @@ class N2KControl(object):
     def on_value(self, name, value):
         '''called by the bridge for every value received from pypilot'''
         self.values[name] = value
+        if name in self.requested and requested_match(value, self.requested[name][0]):
+            del self.requested[name]
         pending = self.pending_engage
         if pending:
             if name == 'ap.mode' and value == pending['mode']:
@@ -1164,6 +1202,13 @@ class N2KControl(object):
             return True
         return False
 
+    def status_due(self, pgn, last, now):
+        '''whether a changed status can be sent now'''
+        if self.prompt_status.get(pgn, 0) > now:
+            del self.prompt_status[pgn]  # once: further changes are rate limited
+            return True
+        return now - last >= STATUS_MIN_PERIOD
+
     def poll(self):
         '''periodic work; returns the messages to send'''
         now = self.now()
@@ -1180,11 +1225,11 @@ class N2KControl(object):
 
         if self.settings['output'].value:
             t, key = self.last_127237
-            if now - t >= STATUS_PERIOD or (key != self.status_key() and now - t >= STATUS_MIN_PERIOD):
+            if now - t >= STATUS_PERIOD or (key != self.status_key() and self.status_due(127237, t, now)):
                 self.send_127237()
         if self.bank() is not None:
             t, state = self.last_127501
-            if now - t >= STATUS_PERIOD or (state != self.indicators(now) and now - t >= STATUS_MIN_PERIOD):
+            if now - t >= STATUS_PERIOD or (state != self.indicators(now) and self.status_due(127501, t, now)):
                 self.send_127501()
         self.poll_alerts(now)
 

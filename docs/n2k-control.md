@@ -136,7 +136,7 @@ headingToSteerCourse.
 ## 4. Path B — digital switching (127502 / 127501)
 
 pypilot appears as one **binary switch bank** with instance
-`n2k.switch.bank`. The default is `off`, and the installer must pick an
+`n2k.switch.bank`. The default is −1 (off), and the installer must pick an
 instance. It must be unique on the bus: two switching devices with the same
 instance will fight.
 
@@ -257,7 +257,7 @@ therefore opt-in, through new persistent settings:
 | Setting | Values | Default | Notes |
 |---|---|---|---|
 | `n2k.control` | `off` / `monitor` / `steer` / `full` | `monitor` | **monitor:** status, alerts and path C reads only, **but standby is always honoured**, like a STBY key on any head. **steer:** adds paths A and B. **full:** adds path C writes. |
-| `n2k.switch.bank` | `off` or 0–252 | `off` | Switch-bank instance for path B |
+| `n2k.switch.bank` | −1 (off) or 0–252 | −1 | Switch-bank instance for path B. A range so clients can edit it; fractional values round to the nearest instance. |
 | `n2k.control.allowed` | List of 64-bit ISO NAMEs | empty (= any) | Restricts control to known devices. This prevents mistakes, not attacks: NAMEs can be spoofed. |
 | `n2k.control.jog_pulse` | 0.1–1.0 s | 0.3 | Duration of one jog pulse |
 | `n2k.installation_description` | text | `""` | Persisted Description 1 |
@@ -400,7 +400,7 @@ Already supported by the current library:
 
 ## 11. Decisions
 
-- ~~Default switch-bank instance~~ Decided: `off`. With a fixed default,
+- ~~Default switch-bank instance~~ Decided: off (−1). With a fixed default,
   switching gear already using that bank (lights, pumps) would also control
   the autopilot.
 - ~~127237 True → gps mode~~ Decided: True heading commands are refused (§3.2).

@@ -2,6 +2,8 @@
 
 # NMEA2000 bridge for pypilot
 
+from __future__ import annotations
+
 import asyncio
 import calendar
 import datetime
@@ -15,8 +17,14 @@ from nonblockingpipe import NonBlockingPipe
 from values import EnumProperty, Property, RangeProperty, StringValue
 import logging
 
-import nmea2000
-import n2k_control
+# a missing or broken nmea2000 install disables N2K rather than pypilot
+try:
+    import nmea2000
+    import n2k_control
+    import_error = None
+except Exception as e:
+    nmea2000 = None
+    import_error = e
 
 log = logging.getLogger('n2k')
 
@@ -38,6 +46,7 @@ class N2KBridge(object):
     def __init__(self, server):
         self.client = pypilotClient(server)
         self.client.connection.name += 'n2kbridge'
+        self.wake_event = None  # created in the bridge's process, by n2k_process
         self.multiprocessing = server.multiprocessing
         self.pipe, self.pipe_out = NonBlockingPipe('n2k pipe', self.multiprocessing)
         # Require multiprocessing mode — N2K runs only in a separate process.
@@ -82,7 +91,10 @@ class N2KBridge(object):
         control_settings = {
             'control': self.client.register(EnumProperty('n2k.control', 'monitor',
                                                          n2k_control.CONTROL_LEVELS, persistent=True)),
-            'bank': self.client.register(Property('n2k.switch.bank', 'off', persistent=True)),
+            # -1 is off. A range so clients can edit it: an enum of every instance
+            # would overflow the clients' 16 KB line buffer for the values list.
+            'bank': self.client.register(RangeProperty('n2k.switch.bank', -1, -1, 252, step=1,
+                                                       persistent=True)),
             'allowed': self.client.register(Property('n2k.control.allowed', [], persistent=True)),
             'jog_pulse': self.client.register(RangeProperty('n2k.control.jog_pulse', .3, .1, 1, persistent=True)),
             'description': self.client.register(Property('n2k.installation_description', '', persistent=True)),
@@ -258,12 +270,14 @@ class N2KBridge(object):
         handled = self.control.handle_group_function(message, payload)
         await self.send_control_messages(self.control.outbox)
         self.control.outbox = []
+        self.wake()
         return handled
 
     async def handle_iso_request(self, message, pgn):
         handled = self.control.handle_iso_request(message, pgn)
         await self.send_control_messages(self.control.outbox)
         self.control.outbox = []
+        self.wake()
         return handled
 
     async def send_control_messages(self, messages):
@@ -353,6 +367,7 @@ class N2KBridge(object):
 
     async def parse_pgn(self, message: nmea2000.NMEA2000Message):
         if self.control.handle_message(message):
+            self.wake()  # send what it set to pypilot now
             return
         device = 'N2K%d' % message.source if message.source is not None else 'N2K'
 
@@ -558,7 +573,23 @@ class N2KBridge(object):
 
         await self.send_control_messages(control_messages)
 
+    def wake(self):
+        '''run the next poll now rather than after its timeout'''
+        event = getattr(self, 'wake_event', None)
+        if event:
+            event.set()
+
+    def wake_on_pypilot(self):
+        '''wake when pypilot sends us something, so changes reach the bus at once'''
+        fileno = getattr(getattr(self.client, 'connection', None), 'fileno', None)
+        fd = fileno() if fileno else None
+        if fd:
+            asyncio.get_running_loop().add_reader(fd, self.wake)
+
     async def poll(self, timeout=100):
+        event = getattr(self, 'wake_event', None)
+        if event:
+            event.clear()  # anything arriving from here on runs the next poll
         await self.ensure_transport()
 
         self.publish_msgs()
@@ -574,11 +605,21 @@ class N2KBridge(object):
         await self.output_pgns()
 
         if timeout:
-            await asyncio.sleep(timeout / 1000.0)
+            # until pypilot or a control message on the bus needs us, for
+            # commands to take effect and be confirmed without waiting a poll
+            if event:
+                try:
+                    await asyncio.wait_for(event.wait(), timeout / 1000.0)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(timeout / 1000.0)
 
 
     async def n2k_process(self):
         await self.setup()
+        self.wake_event = asyncio.Event()
+        self.wake_on_pypilot()
         while True:
             await self.poll(100)
 
@@ -588,6 +629,10 @@ class N2K(object):
     def __init__(self, sensors):
         self.client = sensors.client
         self.sensors = sensors
+        self.n2k_bridge = None
+        if import_error:
+            print('N2K: disabled, nmea2000 failed to import: %s' % import_error)
+            return
         self.n2k_bridge = N2KBridge(self.client.server)
         self.process = self.n2k_bridge.process
         self.pipe = self.n2k_bridge.pipe_out
@@ -605,6 +650,8 @@ class N2K(object):
                     self.sensors.write(name, msgs[name], 'can')
 
     def poll(self):
+        if not self.n2k_bridge:
+            return
         if not self.n2k_bridge.process:
             self.n2k_bridge.poll(0)
 

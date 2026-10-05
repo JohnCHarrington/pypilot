@@ -283,6 +283,14 @@ def test_other_bank_ignored():
     assert client.sets == []
 
 
+def test_bank_setting_values():
+    # n2k.switch.bank is a slider from -1 (off) to 252; 'off' was its old default
+    for value, bank in [(-1, None), (-0.4, 0), (5, 5), (5.3, 5), (4.7, 5), ('5', 5), (252, 252),
+                        (253, None), ('off', None), (None, None)]:
+        control, client, clock = make_control(bank=value)
+        assert control.bank() == bank, value
+
+
 def test_mode_channel_off_does_not_disengage():
     control, client, clock = make_control(enabled=True)
     control.handle_message(switch_message(ch2=nc.SWITCH_OFF))
@@ -403,6 +411,67 @@ def test_indicators():
     clock.t += 1
     status = sent(control, 127501)[-1]
     assert field(decode(127501, encode(status)), 'indicator8').raw_value == nc.SWITCH_OFF
+
+
+# ---- requested values -------------------------------------------------------
+
+def press(control, channel):
+    control.handle_message(switch_message(**{'ch%d' % channel: nc.SWITCH_ON}))
+    control.handle_message(switch_message(**{'ch%d' % channel: nc.SWITCH_OFF}))
+
+
+def test_presses_add_up_before_pypilot_reports():
+    control, client, clock = make_control(enabled=True)
+    for i in range(3):
+        press(control, 8)
+    commands = [v for n, v in client.sets if n == 'ap.heading_command']
+    assert commands == [91.0, 92.0, 93.0]
+    control.on_value('ap.heading_command', 91.0)  # pypilot catching up: still 93 requested
+    press(control, 8)
+    assert sets(client)['ap.heading_command'] == 94.0
+
+
+def test_status_shows_only_what_pypilot_reports():
+    control, client, clock = make_control(enabled=True)
+    press(control, 8)
+    decoded = decode(127237, encode(control.heading_track_control()))
+    assert field(decoded, 'headingToSteerCourse').value == pytest.approx(math.radians(90), abs=1e-3)
+    control.on_value('ap.heading_command', 91.0)
+    decoded = decode(127237, encode(control.heading_track_control()))
+    assert field(decoded, 'headingToSteerCourse').value == pytest.approx(math.radians(91), abs=1e-3)
+
+    press(control, nc.CH_STANDBY)
+    assert control.indicators(clock.t)[nc.CH_STANDBY - 1] == nc.SWITCH_OFF  # still engaged
+    control.on_value('ap.enabled', False)
+    assert control.indicators(clock.t)[nc.CH_STANDBY - 1] == nc.SWITCH_ON
+
+
+def test_command_result_sent_without_waiting():
+    control, client, clock = make_control(enabled=True)
+    press(control, nc.CH_STANDBY)  # echoes 127501 at once, still engaged
+    control.poll()
+    clock.t += .05
+    control.on_value('ap.enabled', False)
+    status = sent(control, 127501)  # well within STATUS_MIN_PERIOD of the echo
+    assert status and field(decode(127501, encode(status[-1])), 'indicator1').raw_value == nc.SWITCH_ON
+    clock.t += .05
+    control.on_value('ap.enabled', True)  # a further change is rate limited again
+    assert sent(control, 127501) == []
+
+
+def test_unreported_request_expires():
+    control, client, clock = make_control(enabled=True)
+    press(control, 8)
+    clock.t += nc.REQUEST_TIMEOUT  # pypilot never reported 91, so it refused or changed it
+    press(control, 8)
+    assert sets(client)['ap.heading_command'] == 91.0
+
+
+def test_rounded_report_matches_request():
+    control, client, clock = make_control(enabled=True)
+    press(control, 8)
+    control.on_value('ap.heading_command', 91.004)
+    assert 'ap.heading_command' not in control.requested
 
 
 # ---- 127237 / 127245 status ------------------------------------------------
