@@ -47,7 +47,10 @@ $(document).ready(function() {
             var type = info['type'];
 
             rows += '<div id="value_' + id + '" />';
-            if(type == 'RangeProperty') {
+            if(type == 'RangeProperty' && 'step' in info) {
+                // a stepped range is a number, like an instance or a count
+                rows += '<input type="number" id="val_' + id + '" min="' + info['min'] + '" max="' + info['max'] + '" step="' + info['step'] + '" />';
+            } else if(type == 'RangeProperty') {
                 min = info['min'];
                 max = info['max'];
                 rows += '<input type="range" id="val_' + id + '" min="' + min + '" max="' + max + '" value = "' + 0 + '" step=".0001" style="width: 100%" />';

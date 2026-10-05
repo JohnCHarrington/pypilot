@@ -47,6 +47,17 @@ def test_range_property_rejects_non_numeric(values):
     assert p.value == 5.0  # unchanged
 
 
+def test_range_property_step(values):
+    p = values.RangeProperty('p', -1, -1, 252, step=1)
+    assert p.info['step'] == 1
+    p.set('5.3')
+    assert p.value == 5 and isinstance(p.value, int)
+    assert p.get_msg() == '5'
+    p.set(253)
+    assert p.value == 5  # unchanged
+    assert 'step' not in values.RangeProperty('q', 5.0, 0.0, 10.0).info
+
+
 def test_enum_property_accepts_member(values):
     e = values.EnumProperty('e', 'a', ['a', 'b', 'c'])
     e.set('b')

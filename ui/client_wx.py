@@ -119,7 +119,9 @@ class MainFrame(wx.Frame):
                 proc()
 
             elif t == 'RangeProperty' or t == 'RangeSetting':
-                useSlider = True
+                # a stepped range is a number, like an instance or a count
+                step = value_list[name].get('step')
+                useSlider = not step
                 def proc():
                     r = value_list[name]['min'], value_list[name]['max']
                     if useSlider:
@@ -128,8 +130,8 @@ class MainFrame(wx.Frame):
                     else:
                         s = wx.SpinCtrlDouble(self.scrolledWindow)
                         s.SetRange(r[0], r[1])
-                        s.SetIncrement(min(1, (r[1] - r[0]) / 100.0))
-                        s.SetDigits(-math.log(s.GetIncrement()) / math.log(10) + 1)
+                        s.SetIncrement(step or min(1, (r[1] - r[0]) / 100.0))
+                        s.SetDigits(max(0, math.ceil(-math.log10(s.GetIncrement()))))
                     sizer.Add( s, 0, wx.EXPAND)
                     self.controls[name] = s
                     sname = name
