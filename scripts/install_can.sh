@@ -1,11 +1,24 @@
 #!/bin/sh
+# Install CAN support for an SPI CAN controller on tinypilot (piCore).
+#
+# piCore doesn't ship CAN kernel modules, so this packages can, can-raw,
+# can-dev and the controller's driver from piCore's kernel module tarball into
+# an extension, can-<kernel>.tcz, loaded at boot. The extension also brings
+# can0 up at the given bitrate; it depends on iproute2, since busybox ip
+# can't configure CAN links.
+#
+# The device tree overlay goes in config.txt on the boot partition, e.g.
+#   dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=23
+#
+# Run as tc. Needs internet access. Persists through tce/optional and
+# onboot.lst, so no backup is needed.
 set -eu
 
 usage() {
     echo "Usage: $0 mcp251x|mcp251xfd [bitrate]"
     echo "  mcp251x   = MCP2515 boards"
     echo "  mcp251xfd = MCP2517FD/MCP2518FD boards"
-    echo "  bitrate   = optional, default 250000"
+    echo "  bitrate   = optional, default 250000 (NMEA 2000)"
     exit 1
 }
 
@@ -13,128 +26,109 @@ DRIVER="${1:-}"
 BITRATE="${2:-250000}"
 
 case "$DRIVER" in
-    mcp251x|mcp251xfd) ;;
+    mcp251x) DRIVER_KO="drivers/net/can/spi/mcp251x.ko" ;;
+    mcp251xfd) DRIVER_KO="drivers/net/can/spi/mcp251xfd/mcp251xfd.ko" ;;
     *) usage ;;
 esac
 
-ARCH="$(uname -m)"
 KVER="$(uname -r)"
-TC_MAJOR="13.x"
-TC_ARCH="armv7"
-TC_MIRROR="http://tinycorelinux.net/${TC_MAJOR}/${TC_ARCH}"
-TCEDIR="/etc/sysconfig/tcedir"
-OPTIONAL="${TCEDIR}/optional"
-ONBOOT="${TCEDIR}/onboot.lst"
-WORK="/tmp/can-install.$$"
-
-if [ "$ARCH" != "armv7l" ]; then
-    echo "This script expects armv7l. Found: $ARCH"
-    exit 1
-fi
-
 case "$KVER" in
-    *piCore-v7) ;;
+    *piCore*) ;;
     *)
-        echo "Unexpected kernel: $KVER"
-        echo "This script is intended for piCore-v7 kernels."
+        echo "Unexpected kernel: $KVER (this script is for piCore)"
         exit 1
         ;;
 esac
+
+# piCore 13 and 16 publish the module tarball under different names
+TC_VERSION="$( (version || cat /usr/share/doc/tc/release.txt) 2>/dev/null | cut -d. -f1)"
+if [ -z "$TC_VERSION" ]; then
+    echo "Can't tell the piCore version"
+    exit 1
+fi
+MIRROR="http://tinycorelinux.net/${TC_VERSION}.x"
+case "$TC_VERSION" in
+    13) MOD_URL="${MIRROR}/armv7/releases/RPi/src/kernel/${KVER}_modules.tar.xz" ;;
+    *) MOD_URL="${MIRROR}/armhf/release/src/kernel/modules-${KVER}.tar.xz" ;;
+esac
+
+TCEDIR="/etc/sysconfig/tcedir"
+OPTIONAL="${TCEDIR}/optional"
+ONBOOT="${TCEDIR}/onboot.lst"
+EXT="can-${KVER}"
+WORK="/tmp/can-install.$$"
 
 cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
+mkdir -p "$WORK"
 
-mkdir -p "$WORK" "$OPTIONAL"
-[ -f "$ONBOOT" ] || touch "$ONBOOT"
+echo "Loading tools..."
+tce-load -wi squashfs-tools xz iproute2
 
-echo "Loading build/runtime dependencies..."
-tce-load -wi compiletc git squashfs-tools iproute2 linux-5.10.y_api_headers wget
+echo "Downloading kernel modules for ${KVER}..."
+wget -O "${WORK}/modules.tar.xz" "$MOD_URL"
 
-echo "Downloading matching kernel modules tarball..."
-MOD_TAR="${WORK}/${KVER}_modules.tar.xz"
-MOD_URL="${TC_MIRROR}/releases/RPi/src/kernel/${KVER}_modules.tar.xz"
-wget -O "$MOD_TAR" "$MOD_URL"
+echo "Packaging ${EXT}.tcz..."
+PKG="${WORK}/pkg"
+SRC="lib/modules/${KVER}/kernel"
+DST="${PKG}/usr/local/lib/modules/${KVER}/kernel"
+MODULES="net/can/can.ko net/can/can-raw.ko drivers/net/can/dev/can-dev.ko ${DRIVER_KO}"
+mkdir -p "${WORK}/modules" "${PKG}/usr/local/tce.installed"
+# the tarball's top directory differs between releases, so look the modules up
+# by path, then extract only them (/tmp is in RAM)
+xz -dc "${WORK}/modules.tar.xz" | tar -t > "${WORK}/contents"
+members=""
+for module in $MODULES; do
+    member="$(grep -m 1 "${SRC}/${module}\$" "${WORK}/contents" || true)"
+    if [ -z "$member" ]; then
+        echo "Module ${module} not found in ${MOD_URL}"
+        exit 1
+    fi
+    members="$members $member"
+done
+# shellcheck disable=SC2086 # members is a list of paths without spaces
+xz -dc "${WORK}/modules.tar.xz" | tar -x -C "${WORK}/modules" $members
+for module in $MODULES; do
+    mkdir -p "$(dirname "${DST}/${module}")"
+    cp "$(find "${WORK}/modules" -path "*/${SRC}/${module}")" "${DST}/${module}"
+done
 
-echo "Extracting kernel modules tarball..."
-mkdir -p "${WORK}/modules"
-tar -xf "$MOD_TAR" -C "${WORK}/modules"
-
-echo "Packaging CAN kernel modules..."
-PKG_MOD="${WORK}/pkg-mod"
-MOD_BASE_SRC="${WORK}/modules/modules/lib/modules/${KVER}"
-MOD_BASE_DST="${PKG_MOD}/usr/local/lib/modules/${KVER}"
-
-mkdir -p "${MOD_BASE_DST}/kernel/net/can"
-mkdir -p "${MOD_BASE_DST}/kernel/drivers/net/can/dev"
-mkdir -p "${MOD_BASE_DST}/kernel/drivers/net/can/spi"
-mkdir -p "${MOD_BASE_DST}/kernel/drivers/net/can/spi/mcp251xfd"
-mkdir -p "${PKG_MOD}/usr/local/tce.installed"
-
-cp "${MOD_BASE_SRC}/kernel/net/can/can.ko" \
-   "${MOD_BASE_DST}/kernel/net/can/"
-cp "${MOD_BASE_SRC}/kernel/net/can/can-raw.ko" \
-   "${MOD_BASE_DST}/kernel/net/can/"
-cp "${MOD_BASE_SRC}/kernel/drivers/net/can/dev/can-dev.ko" \
-   "${MOD_BASE_DST}/kernel/drivers/net/can/dev/"
-
-if [ "$DRIVER" = "mcp251x" ]; then
-    cp "${MOD_BASE_SRC}/kernel/drivers/net/can/spi/mcp251x.ko" \
-       "${MOD_BASE_DST}/kernel/drivers/net/can/spi/"
-    DRIVER_KO="kernel/drivers/net/can/spi/mcp251x.ko"
-else
-    cp "${MOD_BASE_SRC}/kernel/drivers/net/can/spi/mcp251xfd/mcp251xfd.ko" \
-       "${MOD_BASE_DST}/kernel/drivers/net/can/spi/mcp251xfd/"
-    DRIVER_KO="kernel/drivers/net/can/spi/mcp251xfd/mcp251xfd.ko"
-fi
-
-MOD_EXT="can-modules-${KVER}-${DRIVER}"
-MOD_INSTALL="${PKG_MOD}/usr/local/tce.installed/${MOD_EXT}"
-
-cat > "$MOD_INSTALL" <<EOF
+cat > "${PKG}/usr/local/tce.installed/${EXT}" <<EOF
 #!/bin/sh
-KVER="${KVER}"
-BASE="/usr/local/lib/modules/\$KVER"
+# Load the CAN modules and bring can0 up at ${BITRATE} bit/s.
+BASE=/usr/local/lib/modules/${KVER}/kernel
+for module in ${MODULES}; do
+    insmod "\$BASE/\$module" 2>/dev/null
+done
 
-insmod "\$BASE/kernel/net/can/can.ko" 2>/dev/null || true
-insmod "\$BASE/kernel/net/can/can-raw.ko" 2>/dev/null || true
-insmod "\$BASE/kernel/drivers/net/can/dev/can-dev.ko" 2>/dev/null || true
-insmod "\$BASE/${DRIVER_KO}" 2>/dev/null || true
+IP=/usr/local/sbin/ip
+[ -x "\$IP" ] || IP=ip
+
+# can0 appears once the driver binds to the overlay's device
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    "\$IP" link show can0 >/dev/null 2>&1 && break
+    sleep 0.5
+done
+# restart-ms recovers automatically after bus-off
+"\$IP" link set can0 up type can bitrate ${BITRATE} restart-ms 100
 EOF
-chmod 775 "$MOD_INSTALL"
+chmod 775 "${PKG}/usr/local/tce.installed/${EXT}"
 
-MOD_TCZ="${OPTIONAL}/${MOD_EXT}.tcz"
-rm -f "$MOD_TCZ"
-mksquashfs "$PKG_MOD" "$MOD_TCZ" -noappend >/dev/null
+rm -f "${OPTIONAL}/${EXT}.tcz"
+mksquashfs "$PKG" "${OPTIONAL}/${EXT}.tcz" -all-root -noappend >/dev/null
+(cd "$OPTIONAL" && md5sum "${EXT}.tcz" > "${EXT}.tcz.md5.txt")
+echo iproute2.tcz > "${OPTIONAL}/${EXT}.tcz.dep"
 
-if ! grep -qxF "${MOD_EXT}.tcz" "$ONBOOT"; then
-    echo "${MOD_EXT}.tcz" >> "$ONBOOT"
-fi
+grep -qxF "${EXT}.tcz" "$ONBOOT" || echo "${EXT}.tcz" >> "$ONBOOT"
 
-echo "Loading extensions now..."
-tce-load -i "$MOD_TCZ"
+echo "Loading ${EXT}.tcz..."
+tce-load -i "${OPTIONAL}/${EXT}.tcz"
 
-echo "Trying to bring up can0 at ${BITRATE}..."
+echo
 if ip link show can0 >/dev/null 2>&1; then
-    ip link set can0 down >/dev/null 2>&1 || true
-    ip link set can0 up type can bitrate "$BITRATE" || true
+    ip -details link show can0
 else
-    echo "can0 does not exist yet."
-    echo "That usually means the SPI/CAN overlay is still missing or incorrect."
+    echo "can0 does not exist: check the dtoverlay line in config.txt, and dmesg | grep -i mcp251"
 fi
-
-echo
-echo "Install complete."
-echo "Persistent extensions:"
-echo "  ${MOD_TCZ}"
-echo
-echo "Added to:"
-echo "  ${ONBOOT}"
-echo
-echo "Post-install checks:"
-echo "  tce-status -i | grep -E 'can-utils|can-modules'"
-echo "  lsmod | grep -E 'can|mcp251'"
-echo "  ip -details link show can0"
-echo "  dmesg | grep -i mcp251"
-echo "  candump can0"
