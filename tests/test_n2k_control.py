@@ -643,6 +643,23 @@ def test_text_tags():
     assert description2(control) == '#9 ERR unknown nope'
 
 
+def test_text_read_value_list():
+    # 'values' isn't reported by pypilotClient: the bridge keeps it as client.values
+    info = {'ap.mode': {'type': 'EnumProperty', 'choices': ['compass', 'gps'], 'writable': True},
+            'servo.voltage': {'type': 'SensorValue'}}
+    control, client, clock = make_control()
+    client.values = Setting(info)
+    full = json.dumps(info, separators=(',', ':'))
+    got, offset = '', 0
+    while offset < len(full):
+        text(control, 'PP#4:values@%d' % offset)
+        header, chunk = description2(control).split('=', 1)
+        assert header == '#4 values@%d/%d' % (offset, len(full))
+        got += chunk
+        offset += len(chunk)
+    assert json.loads(got) == info
+
+
 def test_text_chunked_read():
     points = [[round(i * 1.1, 1), -i, i * 2] for i in range(30)]
     control, client, clock = make_control(**{'imu.compass.calibration.points': points})

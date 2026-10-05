@@ -733,8 +733,11 @@ class N2KControl(object):
     def own_value(self, name):
         '''(True, value) for a value this process registered itself, such as the
         n2k.* settings: its client keeps those and never reports them as received'''
+        if name == 'values':  # the info for every value, as pypilot_web's catalog
+            info = self.value_list()
+            return info is not None, info
         own = getattr(getattr(self.client, 'values', None), 'values', None)
-        if isinstance(own, dict) and name in own and name not in ('values', 'watch'):
+        if isinstance(own, dict) and name in own and name != 'watch':
             return True, own[name].value
         return False, None
 
