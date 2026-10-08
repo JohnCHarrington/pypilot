@@ -25,11 +25,7 @@ class gpio(object):
         # so that the main loop (typically in hat.py) can poll on the file descriptor of the pipe
         # and react quickly to key presses without having to constantly read them at a high rate
         self.pipe = NonBlockingPipe(str(self), True)
-        
-        if orangepi:
-            self.pins = [11, 16, 13, 15, 12]
-        else:
-            self.pins = [17, 20, 27, 22, 18, 5, 6, 26]
+        self.pins = [17, 23, 27, 22, 18, 5, 6]
 
         self.lastkeystate = {}
         for p in self.pins:
