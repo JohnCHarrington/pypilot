@@ -231,8 +231,11 @@ Writes need control level `full`. Reads and `LIST`/`INFO` need `monitor`.
 `PP#<tag>:<command>`, and the result starts with `#<tag> `. For example,
 `PP#12:ap.mode` gives `#12 ap.mode="compass"`. Results are broadcast in one
 shared field, so a tool that might share the bus with another should tag its
-commands and ignore results that aren't its own. Only one command is in
-progress at a time; a new command replaces one still waiting for its value.
+commands and ignore results that aren't its own. Commands from several tools
+can be in progress at once: each one still waiting for its value is answered
+in turn, and if 16 are already waiting a new one gets `ERR busy` at once.
+Results can still be lost on a busy bus, so a tool should send a tagged
+command again if its result doesn't arrive within about half a second.
 
 ### 5.2 Timing
 

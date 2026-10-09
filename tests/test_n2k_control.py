@@ -585,7 +585,7 @@ def test_text_does_not_reuse_value_after_lease():
     clock.t += nc.TEXT_LEASE + 1
     control.poll()
     text(control, 'PP:servo.voltage')
-    assert control.pending_text is not None  # waits for a fresh value
+    assert control.pending_texts  # waits for a fresh value
     control.on_value('servo.voltage', 12.0)
     assert description2(control) == 'servo.voltage=12.0'
 
@@ -654,6 +654,49 @@ def test_text_tags():
     assert description2(control).startswith('ERR tag')
     text(control, 'PP#9:INFO nope')
     assert description2(control) == '#9 ERR unknown nope'
+
+
+def descriptions2(control):
+    '''every installation description 2 sent, in order'''
+    configs = [m for m in control.outbox if m.PGN == 126998]
+    control.outbox = []
+    return [field(decode(126998, encode(m)), 'installationDescription2').value for m in configs]
+
+
+def test_text_requests_from_several_heads_are_all_answered():
+    # neither value is watched yet, so both requests wait; the second must not drop the first
+    control, client, clock = make_control()
+    text(control, 'PP#a:servo.voltage', Source(source=35))
+    text(control, 'PP#b:servo.current', Source(source=101))
+    assert len(control.pending_texts) == 2
+    control.on_value('servo.current', 2.0)
+    control.on_value('servo.voltage', 12.5)
+    assert descriptions2(control) == ['#b servo.current=2.0', '#a servo.voltage=12.5']
+    assert control.pending_texts == []
+
+
+def test_text_requests_time_out_independently():
+    control, client, clock = make_control()
+    text(control, 'PP#a:nope.one')
+    clock.t += nc.TEXT_TIMEOUT / 2
+    text(control, 'PP#b:nope.two')
+    clock.t += nc.TEXT_TIMEOUT / 2
+    control.poll()
+    assert control.description2 == '#a ERR unknown nope.one'
+    assert [p['tag'] for p in control.pending_texts] == ['b']
+    clock.t += nc.TEXT_TIMEOUT / 2
+    control.poll()
+    assert control.description2 == '#b ERR unknown nope.two'
+
+
+def test_text_busy_when_too_many_requests_wait():
+    control, client, clock = make_control()
+    for i in range(nc.MAX_PENDING_TEXT):
+        text(control, 'PP#%d:nope.%d' % (i, i))
+    control.outbox = []
+    text(control, 'PP#x:nope.x')
+    assert descriptions2(control) == ['#x ERR busy']
+    assert len(control.pending_texts) == nc.MAX_PENDING_TEXT
 
 
 def test_text_read_value_list():

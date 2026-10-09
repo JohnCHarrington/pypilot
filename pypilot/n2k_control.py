@@ -61,6 +61,7 @@ TEXT_LEASE = 30       # a value read with PP: stays watched this long, so repeat
 MAX_TEXT_LEASES = 32
 WRITE_SETTLE = .5     # longest a PP: write waits for pypilot to report the new value
 TEXT_TIMEOUT = 2
+MAX_PENDING_TEXT = 16  # PP: requests waiting for a value, from all control heads together
 TEXT_LENGTH = 70      # usable characters in an installation description
 
 # alert type, category and state lookups
@@ -240,7 +241,7 @@ class N2KControl(object):
         self.follow_up = None     # (time, angle in rad) of the last follow-up command
         self.switches_on = {}     # channel -> time it was turned on
         self.momentary_until = {}
-        self.pending_text = None  # outstanding PP: read or write
+        self.pending_texts = []   # PP: reads and writes waiting for a value, oldest first
         self.text_tag = None      # tag of the PP# command being run
         self.leases = {}          # values watched for PP: reads -> expiry time
         self.description2 = 'PP:HELP'
@@ -699,12 +700,18 @@ class N2KControl(object):
                                             name in getattr(self.client, 'watches', {}))
             value = self.values.get(name)
             self.lease(name, now)
-        self.pending_text = {'name': name, 'tag': tag, 'write': write, 'offset': offset, 'start': now}
+        pending = {'name': name, 'tag': tag, 'write': write, 'offset': offset, 'start': now}
         if live and (write is None or values_match(value, write)):
-            self.finish_text()
+            self.finish_text(pending)
+        elif len(self.pending_texts) >= MAX_PENDING_TEXT:
+            self.text_result('ERR busy', tag)
+        else:
+            # several control heads can be waiting at once; each gets its own answer
+            self.pending_texts.append(pending)
 
-    def finish_text(self):
-        pending, self.pending_text = self.pending_text, None
+    def finish_text(self, pending):
+        if pending in self.pending_texts:
+            self.pending_texts.remove(pending)
         name, tag, offset = pending['name'], pending['tag'], pending['offset']
         value = self.current_value(name)[1]
         if offset is None:
@@ -719,18 +726,18 @@ class N2KControl(object):
         self.text_result(header + text[offset:offset + max(room, 0)], tag)
 
     def poll_text(self, now):
+        waiting = {pending['name'] for pending in self.pending_texts}
         for name, expiry in list(self.leases.items()):
-            if now > expiry and not (self.pending_text and self.pending_text['name'] == name):
+            if now > expiry and name not in waiting:
                 self.end_lease(name)
-        pending = self.pending_text
-        if not pending:
-            return
-        elapsed = now - pending['start']
-        if pending['write'] is not None and elapsed >= WRITE_SETTLE and self.current_value(pending['name'])[0]:
-            self.finish_text()  # no update matching the request: report what it is now
-        elif elapsed >= TEXT_TIMEOUT:
-            self.pending_text = None
-            self.text_result('ERR unknown ' + pending['name'], pending['tag'])
+        for pending in list(self.pending_texts):
+            elapsed = now - pending['start']
+            if pending['write'] is not None and elapsed >= WRITE_SETTLE and \
+                    self.current_value(pending['name'])[0]:
+                self.finish_text(pending)  # no update matching the request: report what it is now
+            elif elapsed >= TEXT_TIMEOUT:
+                self.pending_texts.remove(pending)
+                self.text_result('ERR unknown ' + pending['name'], pending['tag'])
 
     # ---- path B: switch bank --------------------------------------------------
 
@@ -1085,10 +1092,10 @@ class N2KControl(object):
                 command = pending['command']
                 self.set('ap.heading_command', value if command is None else command)
                 self.set('ap.enabled', True)
-        text = self.pending_text
-        if text and name == text['name'] and \
-                (text['write'] is None or values_match(value, text['write'])):
-            self.finish_text()
+        for pending in list(self.pending_texts):
+            if name == pending['name'] and \
+                    (pending['write'] is None or values_match(value, pending['write'])):
+                self.finish_text(pending)
 
     def handle_message(self, message):
         '''called by the bridge for received PGNs, True if it was ours'''
