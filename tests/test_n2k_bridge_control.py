@@ -157,7 +157,7 @@ def startup_bridge(monkeypatch):
 
 def test_transport_waits_for_persistent_settings(monkeypatch):
     bridge, starts, poll = startup_bridge(monkeypatch)
-    for i in range(20):  # no data from the server yet
+    for _ in range(20):  # no data from the server yet
         poll(.1)
     assert starts == []
 
@@ -165,10 +165,10 @@ def test_transport_waits_for_persistent_settings(monkeypatch):
     poll(.1)
     bridge.n2k_transport.set('socketcan')  # persistent setting arrives
     bridge.n2k_interface.set('can1')
-    for i in range(9):
+    for _ in range(9):
         poll(.1)
     assert starts == []  # still settling
-    for i in range(20):
+    for _ in range(20):
         poll(.1)
     assert starts == ['socketcan']  # started once, with the stored settings
 
@@ -179,6 +179,6 @@ def test_transport_waits_for_persistent_settings(monkeypatch):
 
 def test_transport_starts_without_server_data(monkeypatch):
     bridge, starts, poll = startup_bridge(monkeypatch)
-    for i in range(int(bridge.SETTINGS_MAX_WAIT / .1) + 1):
+    for _ in range(int(bridge.SETTINGS_MAX_WAIT / .1) + 1):
         poll(.1)
     assert starts == ['none']
