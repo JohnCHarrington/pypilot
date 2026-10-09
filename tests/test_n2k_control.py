@@ -1,8 +1,8 @@
 """
 Tests for N2K control of pypilot (pypilot/n2k_control.py, docs/n2k-control.md).
 
-Messages are round-tripped through the nmea2000 library's generated
-encoders/decoders so the field layouts are checked against the real codec.
+Messages are round-tripped through the nmea2000 library's encoder and
+decoder so the field layouts are checked against the real codec.
 """
 import json
 import math
@@ -10,7 +10,7 @@ import math
 import pytest
 
 nmea2000 = pytest.importorskip('nmea2000')
-from nmea2000 import pgns
+from nmea2000 import backend, pgns
 
 import n2k_control as nc
 
@@ -120,6 +120,19 @@ def lau(text):
     return bytes([len(text) + 2, 1]) + text.encode()
 
 
+def command(payload, source=None):
+    '''the library's decoding of a 126208 payload, as the device hands it over'''
+    source = source or Source()
+    message = backend.decode(126208, payload, source.source, 100, 3)
+    assert message is not None
+    message.source_iso_name = source.source_iso_name
+    return message
+
+
+def handle(control, source, payload):
+    return control.handle_group_function(command(payload, source))
+
+
 def ack_codes(control):
     acks = [m for m in control.outbox if m.PGN == 126208]
     assert len(acks) == 1
@@ -133,33 +146,33 @@ def sets(client):
     return dict(client.sets)
 
 
-# ---- 126208 parsing ---------------------------------------------------------
+# ---- 126208 commands, as the library decodes them ---------------------------
 
-def test_parse_command_multiple_parameters():
+def test_command_parameters():
     payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.pi / 2))])
-    pgn, params = nc.parse_command(payload)
-    assert pgn == 127237
-    assert params[0] == (5, 4)
-    assert params[1] == (7, 1)
+    params = nc.command_parameters(command(payload))
+    assert params[:2] == [(5, 4), (7, 1)]
     assert params[2][0] == 11 and params[2][1] == pytest.approx(math.pi / 2, abs=1e-4)
 
 
-def test_parse_command_signed_and_not_available():
+def test_command_parameters_signed_and_not_available():
     payload = command_payload(127237, [(10, (-1000).to_bytes(2, 'little', signed=True)),
                                        (11, b'\xff\xff')])
-    pgn, params = nc.parse_command(payload)
+    params = nc.command_parameters(command(payload))
     assert params[0][1] == pytest.approx(-.1)
     assert params[1] == (11, None)
 
 
-def test_parse_command_string():
-    pgn, params = nc.parse_command(command_payload(126998, [(1, lau('PP:ap.mode'))]))
-    assert (pgn, params) == (126998, [(1, 'PP:ap.mode')])
+def test_command_parameters_string():
+    params = nc.command_parameters(command(command_payload(126998, [(1, lau('PP:ap.mode'))])))
+    assert params == [(1, 'PP:ap.mode')]
 
 
-def test_parse_command_truncated():
-    with pytest.raises(ValueError):
-        nc.parse_command(command_payload(127237, [(11, b'\x01')]))
+def test_unreadable_lookup_refused_as_out_of_range():
+    control, client, clock = make_control()
+    handle(control, Source(), command_payload(127237, [(5, bytes([6]))]))  # 6: out of range
+    assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_OUT_OF_RANGE])
+    assert client.sets == []
 
 
 # ---- path A: 127237 commands -------------------------------------------------
@@ -167,7 +180,7 @@ def test_parse_command_truncated():
 def test_engage_with_heading_to_steer():
     control, client, clock = make_control()
     payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.radians(45)))])
-    assert control.handle_group_function(Source(), payload)
+    assert handle(control, Source(), payload)
     assert ack_codes(control) == (nc.PGN_ACK, [0, 0, 0])
     s = sets(client)
     assert s['ap.enabled'] is True
@@ -176,31 +189,31 @@ def test_engage_with_heading_to_steer():
 
 def test_standby_allowed_at_monitor_but_engage_denied():
     control, client, clock = make_control(level='monitor', enabled=True)
-    assert control.handle_group_function(Source(), command_payload(127237, [(5, bytes([4]))]))
+    assert handle(control, Source(), command_payload(127237, [(5, bytes([4]))]))
     assert ack_codes(control) == (nc.PGN_ACCESS_DENIED, [nc.PARAM_ACCESS_DENIED])
     assert client.sets == []
 
-    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    handle(control, Source(), command_payload(127237, [(5, bytes([0]))]))
     assert ack_codes(control) == (nc.PGN_ACK, [0])
     assert sets(client)['ap.enabled'] is False
 
 
 def test_control_off_leaves_commands_to_library():
     control, client, clock = make_control(level='off')
-    assert not control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    assert not handle(control, Source(), command_payload(127237, [(5, bytes([0]))]))
     assert client.sets == []
 
 
 def test_heading_to_steer_refused_in_wind_mode():
     control, client, clock = make_control(mode='wind', enabled=True)
-    control.handle_group_function(Source(), command_payload(127237, [(11, u16(1))]))
+    handle(control, Source(), command_payload(127237, [(11, u16(1))]))
     assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_TEMPORARY_ERROR])
     assert client.sets == []
 
 
 def test_unsupported_field_rejects_whole_command():
     control, client, clock = make_control()
-    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([4])), (13, u16(.5))]))
+    handle(control, Source(), command_payload(127237, [(5, bytes([4])), (13, u16(.5))]))
     assert ack_codes(control) == (nc.PGN_ACK, [0, nc.PARAM_NOT_SUPPORTED])
     assert client.sets == []
 
@@ -208,20 +221,20 @@ def test_unsupported_field_rejects_whole_command():
 def test_true_heading_reference_not_supported():
     control, client, clock = make_control()
     payload = command_payload(127237, [(5, bytes([4])), (7, bytes([0])), (11, u16(1))])
-    control.handle_group_function(Source(), payload)
+    handle(control, Source(), payload)
     assert ack_codes(control) == (nc.PGN_ACK, [0, nc.PARAM_NOT_SUPPORTED, 0])
     assert client.sets == []
 
 
 def test_unavailable_mode_refused():
     control, client, clock = make_control()
-    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([5]))]))  # track -> nav
+    handle(control, Source(), command_payload(127237, [(5, bytes([5]))]))  # track -> nav
     assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_TEMPORARY_ERROR])
 
 
 def test_non_follow_up_jogs_starboard():
     control, client, clock = make_control()
-    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([1])), (9, bytes([1]))]))
+    handle(control, Source(), command_payload(127237, [(5, bytes([1])), (9, bytes([1]))]))
     assert ack_codes(control) == (nc.PGN_ACK, [0, 0])
     assert client.sets[-1] == ('servo.command', -1)
     clock.t += .5
@@ -232,11 +245,11 @@ def test_non_follow_up_jogs_starboard():
 def test_allowed_list_restricts_steering_but_not_standby():
     control, client, clock = make_control(enabled=True)
     control.settings['allowed'].value = ['0x2222']
-    control.handle_group_function(Source(), command_payload(127237, [(11, u16(1))]))
+    handle(control, Source(), command_payload(127237, [(11, u16(1))]))
     assert ack_codes(control)[0] == nc.PGN_ACCESS_DENIED
-    control.handle_group_function(Source(), command_payload(127237, [(5, bytes([0]))]))
+    handle(control, Source(), command_payload(127237, [(5, bytes([0]))]))
     assert ack_codes(control) == (nc.PGN_ACK, [0])
-    control.handle_group_function(Source(name=0x2222), command_payload(127237, [(5, bytes([4]))]))
+    handle(control, Source(name=0x2222), command_payload(127237, [(5, bytes([4]))]))
     assert ack_codes(control) == (nc.PGN_ACK, [0])
 
 
@@ -321,7 +334,7 @@ def test_engage_in_new_mode_waits_for_heading_in_that_mode():
 def test_mode_change_while_engaged_with_heading_waits_for_mode():
     control, client, clock = make_control(mode='gps', enabled=True)
     payload = command_payload(127237, [(5, bytes([4])), (7, bytes([1])), (11, u16(math.radians(45)))])
-    control.handle_group_function(Source(), payload)
+    handle(control, Source(), payload)
     assert ack_codes(control) == (nc.PGN_ACK, [0, 0, 0])
     assert client.sets == [('ap.mode', 'compass')]  # pypilot would overwrite a command set now
     control.on_value('ap.mode', 'compass')
@@ -522,7 +535,7 @@ def test_rudder_only_for_local_sensor():
 # ---- path C: PP: text commands ----------------------------------------------
 
 def text(control, command, source=None):
-    control.handle_group_function(source or Source(), command_payload(126998, [(1, lau(command))]))
+    handle(control, source or Source(), command_payload(126998, [(1, lau(command))]))
     return ack_codes(control)
 
 
@@ -741,7 +754,7 @@ def test_plain_description_is_stored():
 
 def test_description2_not_writable():
     control, client, clock = make_control()
-    control.handle_group_function(Source(), command_payload(126998, [(2, lau('x'))]))
+    handle(control, Source(), command_payload(126998, [(2, lau('x'))]))
     assert ack_codes(control) == (nc.PGN_ACK, [nc.PARAM_ACCESS_DENIED])
 
 

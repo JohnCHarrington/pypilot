@@ -333,25 +333,26 @@ Alerts are standard N2K alert messages. Garmin plotters, for example, receive
 
 ## 8. Required changes to the `nmea2000` library (fork)
 
-pypilot parses 126208 payloads itself (`n2k_control.parse_command`), using
-the field widths of 127237 and 126998. It also keeps 126998 up to date itself:
-it sets `installation_description1/2` on the device and broadcasts 126998.
+pypilot reads 126208 commands as the library decodes them
+(`n2k_control.command_parameters`). The canboat-based library types each
+parameter by the field of the commanded PGN it refers to, and a lookup's code
+is its `raw_value`, so pypilot needs no field layouts of its own. pypilot also
+keeps 126998 up to date itself: it sets `installation_description1/2` on the
+device and broadcasts 126998.
 
 `N2KBridge.attach_control` uses the hooks below if the library has them. These
 are the interfaces it expects:
 
 1. **`N2KDevice.set_group_function_handler(handler)`**
-   - Signature: `async handler(message: NMEA2000Message, payload: bytes) -> bool`.
+   - Signature: `async handler(message: NMEA2000Message) -> bool`, given the
+     decoded message.
    - Called for every 126208 addressed to this device or to broadcast.
-   - `payload` is the complete reassembled fast-packet data.
-   - Called **before** the default handling in `_handle_group_function`
-     (`device.py:456`). If it returns True the library sends nothing, because
-     pypilot has sent its own Acknowledge. If it returns False, the current
-     NAK behaviour applies.
+   - Called **before** the device's default group-function handling. If it
+     returns True the library sends nothing, because pypilot has sent its own
+     Acknowledge. If it returns False, the current NAK behaviour applies.
 2. **`N2KDevice.set_iso_request_handler(handler)`**
    - Signature: `async handler(message: NMEA2000Message, requested_pgn: int) -> bool`.
-   - Called from `_handle_iso_request` (`device.py:436`) for PGNs the library
-     doesn't answer itself.
+   - Called for the PGNs the library doesn't answer itself.
    - True means the request was answered; False means NAK as now.
 3. **`N2KDevice.own_name`.** A public property for the 64-bit ISO NAME
    pypilot claimed. It's used as the alert data source and to recognise alert

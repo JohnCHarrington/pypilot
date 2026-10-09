@@ -266,8 +266,8 @@ class N2KBridge(object):
             print('N2KBridge: nmea2000 library has no %s; 127237 commands and PP: text commands are unavailable'
                   % ', '.join(missing))
 
-    async def handle_group_function(self, message, payload):
-        handled = self.control.handle_group_function(message, payload)
+    async def handle_group_function(self, message):
+        handled = self.control.handle_group_function(message)
         await self.send_control_messages(self.control.outbox)
         self.control.outbox = []
         self.wake()

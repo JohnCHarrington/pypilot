@@ -10,7 +10,7 @@ nmea2000 = pytest.importorskip('nmea2000')
 
 import n2k
 import n2k_control as nc
-from test_n2k_control import command_payload, encode, switch_message, Source
+from test_n2k_control import command, command_payload, encode, switch_message, Source
 
 
 class FakeClient:
@@ -91,7 +91,7 @@ def test_hooks_answer_commands():
     bridge.client.registered['n2k.control'].value = 'steer'
     bridge.last_values.update({'ap.modes': ['compass'], 'ap.heading': 10.0})
     handled = asyncio.run(gateway.group_function_handler(
-        Source(), command_payload(127237, [(5, bytes([4]))])))
+        command(command_payload(127237, [(5, bytes([4]))]))))
     assert handled
     assert ('ap.enabled', True) in bridge.client.sets
     assert [m.PGN for m in gateway.sent if m.PGN == 126208] == [126208]

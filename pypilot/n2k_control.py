@@ -121,91 +121,29 @@ def make_message(pgn, fields, id='', destination=255, priority=6):
                                     priority=priority, fields=nfields)
 
 
-# Field layouts of the PGNs we accept 126208 Commands for, by 1-based field
-# index: (bits, signed, resolution). bits == 'lau' is a STRING_LAU.
-# resolution None means a lookup, returned as its raw integer.
-COMMAND_FIELDS = {
-    127237: {1: (2, False, None),         # rudderLimitExceeded
-             2: (2, False, None),         # offHeadingLimitExceeded
-             3: (2, False, None),         # offTrackLimitExceeded
-             4: (2, False, None),         # override
-             5: (3, False, None),         # steeringMode
-             6: (3, False, None),         # turnMode
-             7: (2, False, None),         # headingReference
-             8: (5, False, None),         # reserved
-             9: (3, False, None),         # commandedRudderDirection
-             10: (16, True, .0001),       # commandedRudderAngle
-             11: (16, False, .0001),      # headingToSteerCourse
-             12: (16, False, .0001),      # track
-             13: (16, False, .0001),      # rudderLimit
-             14: (16, False, .0001),      # offHeadingLimit
-             15: (16, False, 1),          # radiusOfTurnOrder
-             16: (16, True, 3.125e-5),    # rateOfTurnOrder
-             17: (16, False, 1),          # offTrackLimit
-             18: (16, False, .0001)},     # vesselHeading
-    126998: {1: ('lau', False, None),     # installationDescription1
-             2: ('lau', False, None),     # installationDescription2
-             3: ('lau', False, None)},    # manufacturerInformation
-}
+# The PGNs we accept 126208 Commands for
+COMMAND_PGNS = (127237, 126998)
+# 127237 fields that are lookups, refused as out of range when unreadable
+COMMAND_LOOKUPS = (5, 7, 9)
 
 
-def decode_field(raw, bits, signed, resolution):
-    if signed:
-        if raw == (1 << (bits - 1)) - 1:
-            return None  # not available
-        if raw & (1 << (bits - 1)):
-            raw -= 1 << bits
-    elif raw == (1 << bits) - 1:
+def field(message, name):
+    try:
+        return message.get_field_by_id(name).value
+    except ValueError:
         return None
-    if resolution is None:
-        return raw
-    return raw * resolution
 
 
-def decode_lau(data):
-    length, encoding = data[0], data[1]
-    text = bytes(data[2:length])
-    if encoding == 1:
-        return text.decode('ascii', errors='replace'), length
-    return text.decode('utf-16-le', errors='replace'), length
-
-
-def parse_command(payload):
-    '''Split a 126208 Command group function payload into
-    (pgn, [(field index, value), ...]). Returns params None for a PGN whose
-    layout we don't know. Each parameter value takes the target field's
-    width rounded up to whole bytes.'''
-    payload = bytes(payload)
-    if len(payload) < 6 or payload[0] != 1:
-        raise ValueError('not a command group function')
-    pgn = int.from_bytes(payload[1:4], 'little')
-    count = payload[5]
-    layout = COMMAND_FIELDS.get(pgn)
-    if layout is None:
-        return pgn, None
-    params, pos = [], 6
-    for i in range(count):
-        if pos >= len(payload):
-            raise ValueError('truncated command')
-        index = payload[pos]
-        pos += 1
-        if index not in layout:
-            raise ValueError('unknown field %d of PGN %d' % (index, pgn))
-        bits, signed, resolution = layout[index]
-        if bits == 'lau':
-            if pos + 2 > len(payload) or pos + payload[pos] > len(payload):
-                raise ValueError('truncated string')
-            value, length = decode_lau(payload[pos:])
-            pos += length
-        else:
-            nbytes = (bits + 7) // 8
-            if pos + nbytes > len(payload):
-                raise ValueError('truncated value')
-            raw = int.from_bytes(payload[pos:pos + nbytes], 'little') & ((1 << bits) - 1)
-            value = decode_field(raw, bits, signed, resolution)
-            pos += nbytes
-        params.append((index, value))
-    return pgn, params
+def command_parameters(message):
+    '''A decoded 126208 Command's parameters as [(field index, value), ...].
+    nmea2000 types each value by the field of the commanded PGN it refers to;
+    its raw_value is a lookup's code, or a number's or string's value. A
+    value that isn't available, or is out of range, is None.'''
+    params = []
+    for entry in field(message, '##list##') or []:
+        value = entry['value']
+        params.append((entry['parameter'].value, None if value.value is None else value.raw_value))
+    return params
 
 
 def build_ack(destination, pgn, pgn_error, param_errors):
@@ -517,9 +455,11 @@ class N2KControl(object):
     def command_127237(self, params, message):
         values = dict(params)
         errors = {index: PARAM_ACK for index in values}
-        for index in values:
+        for index, value in values.items():
             if index not in [5, 7, 9, 10, 11]:
                 errors[index] = PARAM_NOT_SUPPORTED
+            elif index in COMMAND_LOOKUPS and value is None:
+                errors[index] = PARAM_OUT_OF_RANGE  # not available, or out of the lookup's range
 
         steering = values.get(5)
         reference = values.get(7)
@@ -545,8 +485,6 @@ class N2KControl(object):
                 mode = 'compass'
         elif steering == STEERING_TRACK:
             mode = 'nav'
-        elif steering is not None and steering > STEERING_TRACK:
-            errors[5] = PARAM_OUT_OF_RANGE
 
         if steering in [STEERING_STANDALONE, STEERING_HEADING, STEERING_TRACK] and \
            mode not in (self.value('ap.modes') or []):
@@ -597,6 +535,8 @@ class N2KControl(object):
         for index, text in params:
             if index != 1:
                 errors.append(PARAM_ACCESS_DENIED)  # description 2 is our output
+            elif not isinstance(text, str):
+                errors.append(PARAM_INVALID)  # not available
             elif text.startswith('PP:') or text.startswith('PP#'):
                 if not self.permitted(MONITOR, message):
                     errors.append(PARAM_ACCESS_DENIED)
@@ -1162,31 +1102,21 @@ class N2KControl(object):
             return True
         return False
 
-    def handle_group_function(self, message, payload):
-        '''126208 handler for the library. Returns True if we answered it,
-        False to let the library answer (it NAKs).'''
-        if self.level() == OFF or not payload:
+    def handle_group_function(self, message):
+        '''126208 handler for the library, given the decoded message. Returns
+        True if we answered it, False to let the library answer (it NAKs).'''
+        if self.level() == OFF:
             return False
-        function = payload[0]
-        if function == 0:  # request: answer it if it's for something we send
-            pgn = int.from_bytes(bytes(payload[1:4]), 'little')
-            return self.handle_iso_request(message, pgn)
-        if function != 1:
+        pgn = field(message, 'pgn')
+        if message.id == 'nmeaRequestGroupFunction':  # answer it if it's for something we send
+            return pgn is not None and self.handle_iso_request(message, pgn)
+        if message.id != 'nmeaCommandGroupFunction' or pgn not in COMMAND_PGNS:
             return False
-        try:
-            pgn, params = parse_command(payload)
-        except ValueError:
-            pgn = int.from_bytes(bytes(payload[1:4]), 'little')
-            if pgn not in COMMAND_FIELDS:
-                return False
-            self.outbox.append(build_ack(message.source, pgn, PGN_ACK, [PARAM_INVALID]))
-            return True
+        params = command_parameters(message)
         if pgn == 127237:
             pgn_error, errors = self.command_127237(params, message)
-        elif pgn == 126998:
-            pgn_error, errors = self.command_126998(params, message)
         else:
-            return False
+            pgn_error, errors = self.command_126998(params, message)
         self.outbox.append(build_ack(message.source, pgn, pgn_error, errors))
         return True
 
