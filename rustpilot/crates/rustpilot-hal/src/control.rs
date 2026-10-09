@@ -60,6 +60,34 @@ impl Mode {
     }
 }
 
+/// A set of modes (`ap.modes`, the modes the current sensors allow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct ModeSet(u8);
+
+impl ModeSet {
+    /// The empty set.
+    pub const EMPTY: ModeSet = ModeSet(0);
+
+    const fn bit(m: Mode) -> u8 {
+        1 << (m as u8)
+    }
+
+    /// Whether `m` is in the set.
+    pub const fn contains(self, m: Mode) -> bool {
+        self.0 & Self::bit(m) != 0
+    }
+
+    /// Add `m`.
+    pub fn insert(&mut self, m: Mode) {
+        self.0 |= Self::bit(m);
+    }
+
+    /// The modes in pypilot's order.
+    pub fn iter(self) -> impl Iterator<Item = Mode> {
+        Mode::ALL.into_iter().filter(move |m| self.contains(*m))
+    }
+}
+
 /// How much a control link may do. Ordered: each level includes the ones
 /// below it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,12 +130,14 @@ pub enum ControlCommand {
     /// Start a tack.
     Tack(TackDirection),
     /// Manual non-follow-up steering: run the motor at `speed` (−1..1) for
-    /// one pulse, ended by the core's own timer.
+    /// one pulse, ended by the core's own timer. Disengages first.
     Jog {
-        /// Signed motor speed, −1 (port) to 1 (starboard).
+        /// Signed motor speed, positive to port as in pypilot's
+        /// `servo.command`.
         speed: f32,
     },
     /// Manual follow-up steering: drive the rudder to an angle.
+    /// Disengages first.
     RudderAngle(Degrees),
     /// Write any pypilot value by name, with its value as JSON text, as the
     /// pypilot protocol and `PP:` commands do.
@@ -165,8 +195,10 @@ pub struct PilotState {
     pub compass_heading: Degrees,
     /// Calibrated rudder angle, if a rudder sensor is present.
     pub rudder_angle: Option<Degrees>,
-    /// Servo fault flags (`servo.flags`).
-    pub servo_flags: u16,
+    /// Modes the current sensors allow (`ap.modes`).
+    pub modes: ModeSet,
+    /// Servo flags (`servo.flags`), see `rustpilot_core::servo::flags`.
+    pub servo_flags: u32,
 }
 
 /// A link that accepts commands and publishes state.

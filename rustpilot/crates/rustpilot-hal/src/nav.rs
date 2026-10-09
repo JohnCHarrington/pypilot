@@ -18,8 +18,10 @@ pub enum NavMessage {
     Water(WaterSpeed),
     /// Route steering from a plotter.
     Route(RouteSteer),
-    /// Rudder angle in degrees, already calibrated by the sender.
-    Rudder(Degrees),
+    /// Rudder reading from an instrument (NMEA RSA, N2K 127245). The core
+    /// applies the same rudder calibration to it as to the motor
+    /// controller's raw reading, as pypilot does.
+    Rudder(f32),
 }
 
 /// A [`NavMessage`] with where and when it came from.

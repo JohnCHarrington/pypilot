@@ -21,7 +21,8 @@ pub mod rudder;
 
 pub use can::{CanBus, CanFrame};
 pub use control::{
-    ControlCommand, ControlLevel, ControlLink, ControlRequest, Mode, PilotState, TackDirection,
+    ControlCommand, ControlLevel, ControlLink, ControlRequest, Mode, ModeSet, PilotState,
+    TackDirection,
 };
 pub use imu::{ImuReading, ImuSource};
 pub use motor::{MotorCommand, MotorController, MotorLimits};

@@ -142,6 +142,7 @@ pub struct MotorTelemetry {
     pub controller_temp: Option<f32>,
     /// Motor temperature, °C.
     pub motor_temp: Option<f32>,
-    /// Raw rudder sensor reading, 0..1 of the ADC range.
+    /// Raw rudder sensor reading, nominally −0.5..0.5. NaN means the
+    /// controller reports its rudder sensor as invalid.
     pub rudder_raw: Option<f32>,
 }

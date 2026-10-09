@@ -17,7 +17,10 @@ Licensed GPL-3.0-or-later, like pypilot.
 | `rustpilot-core` | yes | The autopilot: `Autopilot::step(now, inputs) -> outputs`, no I/O |
 | `rustpilot-n2k` | no (canboat needs std) | NMEA 2000 on the `canboat` crate; 126208 group functions |
 
-`tools/record_pypilot.py` records a running pypilot's IMU, sensor, autopilot
+`tools/golden/generate.py` runs pypilot's own control loop on scripted
+scenarios and writes the golden files that `rustpilot-core/tests/golden.rs`
+replays; rerun it with `python3 tools/golden/generate.py --pypilot ..` after
+changing a scenario. `tools/record_pypilot.py` records a running pypilot's IMU, sensor, autopilot
 and servo values for replay tests.
 
 ## Building
@@ -33,5 +36,7 @@ CI runs both, plus `cargo fmt --check` and `cargo clippy -D warnings`.
 
 ## Status
 
-Phase 0 (foundations). See `docs/phase0-findings.md` for what it checked
-and decided.
+Phase 0 (foundations) is done; see `docs/phase0-findings.md`. Phase 1 ports
+the core: sensor arbitration, wind and GPS filters, APB route steering, the
+basic pilot, tacking, rudder calibration, the servo logic and pypilot's value
+names. See `docs/phase1.md`.
