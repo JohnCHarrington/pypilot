@@ -1,0 +1,14 @@
+[package]
+name = "rustpilot-types"
+description = "Units, angle maths, vectors and quaternions shared by every RustPilot crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libm.workspace = true
+
+[lints]
+workspace = true

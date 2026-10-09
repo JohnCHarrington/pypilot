@@ -1,0 +1,17 @@
+[package]
+name = "rustpilot-core"
+description = "RustPilot's autopilot core: control loop, modes, pilots and servo logic with no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustpilot-types.workspace = true
+rustpilot-hal.workspace = true
+libm.workspace = true
+heapless.workspace = true
+
+[lints]
+workspace = true

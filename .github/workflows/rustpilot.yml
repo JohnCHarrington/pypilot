@@ -1,0 +1,40 @@
+name: rustpilot
+
+on:
+  push:
+    paths: ["rustpilot/**", ".github/workflows/rustpilot.yml"]
+  pull_request:
+    paths: ["rustpilot/**", ".github/workflows/rustpilot.yml"]
+
+defaults:
+  run:
+    working-directory: rustpilot
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustpilot
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  no_std:
+    # The portable crates must build for a bare-metal target with no std,
+    # so nothing in the core can quietly depend on an OS.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustpilot
+      - run: cargo build --target thumbv7em-none-eabihf -p rustpilot-types -p rustpilot-hal -p rustpilot-core

@@ -1,0 +1,16 @@
+[package]
+name = "rustpilot-n2k"
+description = "NMEA 2000 for RustPilot, on the canboat crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustpilot-types.workspace = true
+rustpilot-hal.workspace = true
+canboat = { workspace = true, features = ["decode"] }
+
+[lints]
+workspace = true

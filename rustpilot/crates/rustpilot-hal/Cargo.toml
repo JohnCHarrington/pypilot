@@ -1,0 +1,16 @@
+[package]
+name = "rustpilot-hal"
+description = "Connector traits between the RustPilot core and each platform's links"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustpilot-types.workspace = true
+heapless.workspace = true
+embedded-io-async.workspace = true
+
+[lints]
+workspace = true

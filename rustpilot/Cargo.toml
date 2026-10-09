@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/JohnCHarrington/pypilot"
+
+[workspace.dependencies]
+rustpilot-types = { path = "crates/rustpilot-types" }
+rustpilot-hal = { path = "crates/rustpilot-hal" }
+rustpilot-core = { path = "crates/rustpilot-core" }
+libm = "0.2"
+heapless = "0.9"
+embedded-io-async = "0.7"
+canboat = { version = "8.3.0", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+float_cmp = "allow"
