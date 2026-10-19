@@ -16,7 +16,7 @@ from resolv import resolv
 from values import *
 
 # favor lower priority sources
-source_priority = {'gpsd' : 1, 'servo': 1, 'can': 1, 'serial' : 2, 'tcp' : 3,
+source_priority = {'gpsd' : 1, 'servo': 1, 'can': 2, 'serial' : 2, 'tcp' : 3,
                    'signalk' : 4, 'water+wind' : 5, 'gps+wind' : 6, 'none' : 7}
 
 class Sensor:

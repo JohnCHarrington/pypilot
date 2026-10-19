@@ -55,8 +55,6 @@ class py_dep(dep):
                 name = 'pillow'
             elif self.name == 'flask-socketio':
                 name = 'flask-socketio==5'
-            elif self.name == 'nmea2000':
-                name = 'git+https://github.com/johncharrington/nmea2000.git@python-3.8-compat'
             else:
                 name = self.name
             ret = os.system('sudo python3 -m pip install ' + name)
@@ -136,7 +134,7 @@ class RTIMULIB2_dep(dep):
         return True
 
     def install(self):
-        os.system('sudo python3 -m pip install git+https://github.com/johncharrington/nmea2000.git@python-3.8-compat')
+        return os.system('. scripts/install_rtimulib.sh') == 0
 
 class data_dep(dep):
     def __init__(self):

@@ -120,6 +120,7 @@ class N2KBridge(object):
                 self.last_values[name] = 'none'
 
         self.watch_gps_fix = False
+        self.sid = 0
         self.gateway = None
         self.transport_config = None  # transport not started yet
         self.pending_transport_config = None
@@ -159,8 +160,9 @@ class N2KBridge(object):
             self.watch_gps_fix = watch
 
     def next_sid(self):
-        # For single-frame messages, SID should be 0. Return 0.
-        return 0
+        # SID ties together PGNs derived from the same sample; 0-252 are valid, 255 means unavailable
+        self.sid = (self.sid + 1) % 253
+        return self.sid
 
     def current_transport_config(self):
         pgn_filters = self.pgn_filters.value
@@ -328,14 +330,6 @@ class N2KBridge(object):
                 msg[name] = gps[name]
         self.msgs['gps'] = msg
 
-    def angle_to_degrees(self, value):
-        if value is None:
-            return None
-        value = float(value)
-        if abs(value) <= 6.5:
-            return value * 180.0 / 3.141592653589793
-        return value
-
     def course_reference_mode(self, reference):
         if reference is None:
             return 'gps'
@@ -344,18 +338,10 @@ class N2KBridge(object):
             return 'compass'
         return 'gps'
 
-    def signed_xte(self, value, direction=None):
-        if value is None:
-            return None
-        xte = float(value) / 1852.0
-        if direction is None:
-            return xte
-        direction = str(direction).lower()
-        if direction in ['l', 'left', 'port']:
-            return -abs(xte)
-        if direction in ['r', 'right', 'starboard', 'stbd']:
-            return abs(xte)
-        return xte
+    def apb_xte(self, xte):
+        # N2K XTE in meters is positive right of track (steer left),
+        # pypilot's apb xte in nautical miles is positive to steer right
+        return -float(xte) / 1852.0
 
     def update_apb_message(self, device, updates):
         nav = self.nav_devices.get(device, {'device': device})
@@ -401,7 +387,12 @@ class N2KBridge(object):
                 return
             direction_deg = angle_rad * 180.0 / 3.141592653589793
             speed_knots = speed_ms * 1.94384
-            name = 'truewind' if str(ref).lower() in ['true', 't', 'true wind'] else 'wind'
+            if ref == 'Apparent':
+                name = 'wind'
+            elif ref in ('True (boat referenced)', 'True (water referenced)'):
+                name = 'truewind'
+            else:
+                return  # ground referenced wind is a direction over ground, not an angle off the bow
             self.msgs[name] = {'direction': direction_deg, 'speed': speed_knots, 'device': device}
             return
 
@@ -484,11 +475,7 @@ class N2KBridge(object):
                 xte = None
             if xte is None:
                 return
-            try:
-                direction = message.get_field_by_id('xteMode').value
-            except Exception:
-                direction = None
-            self.update_apb_message(device, {'xte': self.signed_xte(xte, direction)})
+            self.update_apb_message(device, {'xte': self.apb_xte(xte)})
             return
 
         if message.PGN == 129284:
@@ -502,18 +489,14 @@ class N2KBridge(object):
                 course_ref = message.get_field_by_id('courseBearingReference').value
             except Exception:
                 course_ref = None
-            updates = {'track': self.angle_to_degrees(track),
+            updates = {'track': track * 180.0 / 3.141592653589793,
                        'mode': self.course_reference_mode(course_ref)}
             try:
                 xte = message.get_field_by_id('xte').value
             except Exception:
                 xte = None
             if xte is not None:
-                try:
-                    direction = message.get_field_by_id('xteMode').value
-                except Exception:
-                    direction = None
-                updates['xte'] = self.signed_xte(xte, direction)
+                updates['xte'] = self.apb_xte(xte)
             self.update_apb_message(device, updates)
             return
 
@@ -544,12 +527,13 @@ class N2KBridge(object):
         if self.n2k_output_enable['attitude'].value or self.n2k_output_enable['heading'].value or \
            self.n2k_output_enable['rate_of_turn'].value or self.n2k_output_enable['rudder'].value:
             if t - self.last_imu_time > 0.1:
+                sid = self.next_sid()
                 if self.n2k_output_enable['attitude'].value and 'imu.pitch' in values and 'imu.roll' in values:
                     pitch_rad = values['imu.pitch'] * 3.141592653589793 / 180.0
                     roll_rad = values['imu.roll'] * 3.141592653589793 / 180.0
                     # PGN 127257 requires: sid, yaw, pitch, roll, reserved_56
                     fields = [
-                        nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
+                        nmea2000.NMEA2000Field(id='sid', value=sid),
                         nmea2000.NMEA2000Field(id='yaw', value=0.0),
                         nmea2000.NMEA2000Field(id='pitch', value=pitch_rad),
                         nmea2000.NMEA2000Field(id='roll', value=roll_rad),
@@ -562,7 +546,7 @@ class N2KBridge(object):
                     heading_rad = values['imu.heading_lowpass'] * 3.141592653589793 / 180.0
                     # Include required PGN 127250 fields: sid, heading, deviation, variation, reference, reserved_58
                     fields = [
-                        nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
+                        nmea2000.NMEA2000Field(id='sid', value=sid),
                         nmea2000.NMEA2000Field(id='heading', value=heading_rad),
                         nmea2000.NMEA2000Field(id='deviation', value=0.0),
                         nmea2000.NMEA2000Field(id='variation', value=0.0),
@@ -576,7 +560,7 @@ class N2KBridge(object):
                     rot_rad_per_s = values['imu.headingrate_lowpass'] * 3.141592653589793 / 180.0
                     # PGN 127251 requires: sid, rate, reserved_40
                     fields = [
-                        nmea2000.NMEA2000Field(id='sid', value=self.next_sid()),
+                        nmea2000.NMEA2000Field(id='sid', value=sid),
                         nmea2000.NMEA2000Field(id='rate', value=rot_rad_per_s),
                         nmea2000.NMEA2000Field(id='reserved_40', value=0),
                     ]
