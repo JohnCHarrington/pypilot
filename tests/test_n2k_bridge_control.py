@@ -86,6 +86,34 @@ def test_settings_watches_and_filters():
     assert 126208 not in bridge.transport_include_pgns()
 
 
+def test_device_advertises_transmit_and_receive_pgns(monkeypatch):
+    options = {}
+
+    class StartingGateway(FakeGateway):
+        def set_receive_callback(self, callback):
+            pass
+
+        def set_status_callback(self, callback):
+            pass
+
+        async def start(self):
+            pass
+
+    def for_python_can(**kwargs):
+        options.update(kwargs)
+        return StartingGateway()
+
+    monkeypatch.setattr(nmea2000.N2KDevice, 'for_python_can', for_python_can)
+    bridge = make_bridge(FakeGateway())
+    bridge.gateway = None
+    bridge.n2k_transport.value = 'socketcan'
+    asyncio.run(bridge.init_transport())
+
+    assert options['transmit_pgns'] == bridge.get_transmit_pgns()
+    assert options['receive_pgns'] == bridge.transport_include_pgns()
+    assert {130306, 129029, 126208, 127502, 126984} <= set(options['receive_pgns'])
+
+
 def test_hooks_answer_commands():
     gateway = FakeGateway()
     bridge = make_bridge(gateway)

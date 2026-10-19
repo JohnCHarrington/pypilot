@@ -229,6 +229,7 @@ class N2KBridge(object):
             "installation_description1": self.control.settings['description'].value or '',
             "installation_description2": self.control.description2,
             "transmit_pgns": self.get_transmit_pgns(),
+            "receive_pgns": include_pgns,
             "address_claim_startup_delay": 0.1,
             "address_claim_detection_time": 0.25,
             "heartbeat_interval": 60.0,
