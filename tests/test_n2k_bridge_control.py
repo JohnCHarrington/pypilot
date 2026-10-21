@@ -3,6 +3,8 @@ Smoke test of N2KBridge's wiring of N2KControl: settings registration,
 PGN filters, library hooks and sending, without a CAN bus or pypilot server.
 """
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -67,6 +69,34 @@ def make_bridge(gateway):
     bridge.gateway = gateway
     bridge.attach_control()
     return bridge
+
+
+def test_n2k_disabled_without_multiprocessing(monkeypatch, capsys):
+    server = SimpleNamespace(multiprocessing=False)
+    sensors = SimpleNamespace(client=SimpleNamespace(server=server))
+    bridge = Mock(side_effect=AssertionError('must not construct a bridge'))
+    monkeypatch.setattr(n2k, 'N2KBridge', bridge)
+    instance = n2k.N2K(sensors)
+    assert instance.n2k_bridge is None
+    instance.poll()
+    bridge.assert_not_called()
+    assert 'N2K: disabled, server multiprocessing is off' in capsys.readouterr().out
+
+
+def test_n2k_process_pipe_polling(monkeypatch):
+    server = SimpleNamespace(multiprocessing=True)
+    sensors = SimpleNamespace(client=SimpleNamespace(server=server), write=Mock())
+    bridge = Mock()
+    bridge.pipe_out.fileno.return_value = 42
+    bridge.pipe_out.recv.side_effect = [{'wind': {'speed': 5}}, False]
+    monkeypatch.setattr(n2k, 'N2KBridge', Mock(return_value=bridge))
+    poller = Mock()
+    poller.poll.side_effect = [[(42, n2k.select.POLLIN)], []]
+    monkeypatch.setattr(n2k.select, 'poll', Mock(return_value=poller))
+    instance = n2k.N2K(sensors)
+    instance.poll()
+    sensors.write.assert_called_once_with('wind', {'speed': 5}, 'can')
+    bridge.poll.assert_not_called()
 
 
 def test_settings_watches_and_filters():

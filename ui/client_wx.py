@@ -7,7 +7,7 @@
 # License as published by the Free Software Foundation; either
 # version 3 of the License, or (at your option) any later version.
 
-import math
+from decimal import Decimal
 import os
 import subprocess
 import sys
@@ -131,7 +131,9 @@ class MainFrame(wx.Frame):
                         s = wx.SpinCtrlDouble(self.scrolledWindow)
                         s.SetRange(r[0], r[1])
                         s.SetIncrement(step or min(1, (r[1] - r[0]) / 100.0))
-                        s.SetDigits(max(0, math.ceil(-math.log10(s.GetIncrement()))))
+                        digits = max(-Decimal(str(v)).normalize().as_tuple().exponent
+                                     for v in (s.GetIncrement(), r[0]))
+                        s.SetDigits(max(0, digits))
                     sizer.Add( s, 0, wx.EXPAND)
                     self.controls[name] = s
                     sname = name

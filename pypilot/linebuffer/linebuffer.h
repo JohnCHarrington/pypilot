@@ -29,6 +29,7 @@ private:
 
     int fd;
     int b, pos, len;
+    bool discarding;
     // two buffers of the same size, doubled as needed for longer lines
     // (pypilot's list of values is one line) up to a limit, for input with
     // no newlines

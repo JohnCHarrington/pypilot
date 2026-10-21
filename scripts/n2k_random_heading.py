@@ -43,10 +43,10 @@ async def send_random_heading(device: nmea2000.N2KDevice, interval: float) -> No
             heading_deg = random.uniform(0.0, 359.9)
             heading_rad = math.radians(heading_deg)
             await device.send(build_heading_message(sid, heading_rad))
-            sid = (sid + 1) % 256
-            await asyncio.sleep(interval)
+            sid = (sid + 1) % 253
         except Exception as e:
             print(f"Error sending message: {e}")
+        await asyncio.sleep(interval)
 
 
 async def main() -> None:

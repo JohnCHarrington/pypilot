@@ -26,6 +26,8 @@ $(document).ready(function() {
     }
 
     function pypilot_set(name, value) {
+        if (typeof value === 'number' && !Number.isFinite(value))
+            return;
         socket.emit('pypilot', name + '=' + JSON.stringify(value));
     }
 
@@ -79,7 +81,8 @@ $(document).ready(function() {
             var id = name.split('.').join('_')
             if(type == 'RangeProperty') {
                 $('#val_' + id).change(name, function(event) {
-                    pypilot_set(event.data, this.valueAsNumber);
+                    if (Number.isFinite(this.valueAsNumber))
+                        pypilot_set(event.data, this.valueAsNumber);
                 });
             } else if(type == 'BooleanProperty') {
                 $('#check_' + id).change(name, function(event) {

@@ -46,7 +46,7 @@ def driver(tmp_path_factory):
 
 def line_lengths(driver, data):
     out = subprocess.run([driver], input=data, capture_output=True, check=True).stdout.decode()
-    return [int(n) for n in out.split() if n.isdigit()], out
+    return [int(n) for n in out.splitlines() if n.isdigit()], out
 
 
 def test_short_lines(driver):
@@ -54,7 +54,7 @@ def test_short_lines(driver):
     assert lengths == [4, 5]  # with their newlines
 
 
-@pytest.mark.parametrize('size', [16382, 16383, 16384, 16385, 40000, 200000])
+@pytest.mark.parametrize('size', [16382, 16383, 16384, 16385, 40000, 200000, (1 << 20) - 1])
 def test_long_lines(driver, size):
     # pypilot's list of values is one line, and can pass 16 KB
     long_line = b'v' * (size - 1) + b'\n'
@@ -62,8 +62,9 @@ def test_long_lines(driver, size):
     assert lengths == [4, size, 4]
 
 
-def test_runaway_input_is_dropped(driver):
+@pytest.mark.parametrize('size', [(1 << 20) - 1, 1 << 20, (1 << 20) + 123, (3 << 20) + 123])
+def test_runaway_input_is_dropped(driver, size):
     # input with no newline doesn't grow the buffer without limit
-    lengths, out = line_lengths(driver, b'z' * (3 << 20) + b'\nok=1\n')
+    lengths, out = line_lengths(driver, b'first=1\n' + b'z' * size + b'\nok=1\nlast=2\n')
     assert 'overflow' in out
-    assert lengths[-1] == 5
+    assert lengths == [8, 5, 7]  # no suffix of the oversized line may be returned

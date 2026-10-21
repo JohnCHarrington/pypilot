@@ -58,6 +58,22 @@ def test_range_property_step(values):
     assert 'step' not in values.RangeProperty('q', 5.0, 0.0, 10.0).info
 
 
+@pytest.mark.parametrize('step', [None, 1, 1.5])
+@pytest.mark.parametrize('invalid', [None, float('nan'), float('inf'), -float('inf'), 'NaN', 'Infinity'])
+def test_range_property_rejects_null_and_nonfinite(values, step, invalid):
+    p = values.RangeProperty('p', 3, 0, 10, step=step)
+    p.set(invalid)
+    assert p.value == 3
+    p.set(6)
+    assert p.value == 6
+
+
+def test_range_property_fractional_step_and_minimum(values):
+    p = values.RangeProperty('p', .25, .25, 10, step=1.5)
+    p.set(2)
+    assert p.value == 1.75
+
+
 def test_enum_property_accepts_member(values):
     e = values.EnumProperty('e', 'a', ['a', 'b', 'c'])
     e.set('b')

@@ -615,6 +615,33 @@ def test_text_set_requires_full():
     assert description2(control).startswith('ERR')
 
 
+@pytest.mark.parametrize('name', ['', 'ap.mode\nservo.command', 'ap.mode\rservo.command',
+                                  'ap mode', 'ap-mode', 'ap/mode', 'ap.mode\x00suffix'])
+@pytest.mark.parametrize('write', [False, True])
+def test_text_rejects_invalid_names(name, write):
+    control, client, clock = make_control(level='full')
+    watches = dict(client.watches)
+    control.text_command(name + ('=1' if write else '@0'), Source())
+    assert control.description2 == 'ERR bad name'
+    assert client.sent == []
+    assert client.watches == watches
+    assert control.pending_texts == []
+
+
+def test_text_checks_name_before_write_permission():
+    control, client, clock = make_control(level='monitor')
+    control.text_command('bad name=1', Source())
+    assert control.description2 == 'ERR bad name'
+    assert client.sent == []
+
+
+def test_text_serializes_parsed_json_on_write():
+    control, client, clock = make_control(level='full')
+    control.text_command('test_value.1={\n"text": "a\\nb",\n"count": 2}', Source())
+    assert client.sent == ['test_value.1={"text": "a\\nb", "count": 2}\n']
+    assert len(client.sent[0].splitlines()) == 1
+
+
 def test_text_set_and_read_back():
     control, client, clock = make_control(level='full', values={
         'ap.pilot.basic.P': {'type': 'RangeProperty', 'min': 0, 'max': .03, 'writable': True}})

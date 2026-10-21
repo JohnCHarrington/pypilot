@@ -23,6 +23,7 @@ LineBuffer::LineBuffer(int _fd)
     : fd(_fd)
 {
     pos = len = b = 0;
+    discarding = false;
     buf[0].resize(INITIAL_SIZE);
     buf[1].resize(INITIAL_SIZE);
 }
@@ -56,11 +57,23 @@ bool LineBuffer::recv()
     if(len + 1 >= (int)buf[b].size() && !grow()) {
         printf("linebuffer overflow!!!! %d\n", len);
         pos = len = 0;
+        discarding = true;
     }
     int c = read(fd, buf[b].data() + len, buf[b].size() - 1 - len);
     if(c <= 0)
         return false;
     len += c;
+    if(discarding) {
+        // Ignore the rest of the oversized line, including its newline.
+        const char *newline = (const char *)memchr(buf[b].data(), '\n', len);
+        if(newline) {
+            int end = newline - buf[b].data() + 1;
+            len -= end;
+            memmove(buf[b].data(), buf[b].data() + end, len);
+            discarding = false;
+        } else
+            len = 0;
+    }
     return true;
 }
 

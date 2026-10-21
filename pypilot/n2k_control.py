@@ -612,6 +612,8 @@ class N2KControl(object):
         if '=' in command:
             name, value = command.split('=', 1)
             name, value = name.strip(), value.strip()
+            if not name or not all(c.isalnum() or c in '._' for c in name):
+                return self.text_result('ERR bad name')
             if not self.permitted(FULL, message):
                 return self.text_result('ERR n2k.control must be full to write')
             if denied_write(name):
@@ -623,17 +625,21 @@ class N2KControl(object):
                 expected = json.loads(value)
             except ValueError:
                 return self.text_result('ERR value must be json')
-            self.client.send(name + '=' + value + '\n')
+            self.client.send(name + '=' + json.dumps(expected) + '\n')
             # report what pypilot actually applied, which may be clamped or rounded
             return self.request_value(name, tag, write=expected)
 
         name, offset = command, None
         if '@' in command:
             name, _, offset = command.partition('@')
+        name = name.strip()
+        if not name or not all(c.isalnum() or c in '._' for c in name):
+            return self.text_result('ERR bad name')
+        if offset is not None:
             if not offset.isdigit():
                 return self.text_result('ERR offset must be a number')
             offset = int(offset)
-        return self.request_value(name.strip(), tag, offset=offset)
+        return self.request_value(name, tag, offset=offset)
 
     def list_page(self, prefix, names, page):
         # pack as many names as fit, each page continuing where the last stopped

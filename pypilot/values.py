@@ -165,10 +165,14 @@ class RangeProperty(Property):
         return '%.4f' % self.value
 
     def set(self, value):
+        if value is None:
+            return
         try:
             value = float(value) # try to convert to number
         except ValueError:
             return # ignore invalid value
+        if not math.isfinite(value):
+            return
         if self.step:
             value = self.min_value + round((value - self.min_value) / self.step) * self.step
             if isinstance(self.step, int) and isinstance(self.min_value, int):

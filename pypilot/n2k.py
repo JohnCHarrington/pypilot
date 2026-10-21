@@ -637,6 +637,9 @@ class N2K(object):
         if import_error:
             print('N2K: disabled, nmea2000 failed to import: %s' % import_error)
             return
+        if not self.client.server.multiprocessing:
+            print('N2K: disabled, server multiprocessing is off')
+            return
         self.n2k_bridge = N2KBridge(self.client.server)
         self.process = self.n2k_bridge.process
         self.pipe = self.n2k_bridge.pipe_out
@@ -656,9 +659,6 @@ class N2K(object):
     def poll(self):
         if not self.n2k_bridge:
             return
-        if not self.n2k_bridge.process:
-            self.n2k_bridge.poll(0)
-
         while True:
             events = self.poller.poll(0)
             if not events:
